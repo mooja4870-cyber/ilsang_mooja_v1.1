@@ -1,6 +1,59 @@
 import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
 import { UserInput, BlogPost } from "../types";
 
+function toSafeMessage(error: unknown): string {
+  if (error && typeof error === "object" && "message" in error) {
+    return String((error as { message?: unknown }).message ?? "");
+  }
+  return "";
+}
+
+function parseRetryDelaySeconds(message: string): number | null {
+  const quotedMatch = message.match(/"retryDelay":"(\d+)s"/i);
+  if (quotedMatch) return Number(quotedMatch[1]);
+
+  const plainMatch = message.match(/retryDelay[^0-9]*(\d+)s/i);
+  if (plainMatch) return Number(plainMatch[1]);
+
+  return null;
+}
+
+function isQuotaExceededMessage(message: string): boolean {
+  return (
+    message.includes('"code":429') ||
+    message.includes("429") ||
+    message.toLowerCase().includes("quota exceeded") ||
+    message.toLowerCase().includes("resource_exhausted")
+  );
+}
+
+function toUserFriendlyError(error: unknown): Error {
+  const message = toSafeMessage(error);
+  const lowerMessage = message.toLowerCase();
+
+  if (lowerMessage.includes("api_key_invalid")) {
+    return new Error("API 키가 유효하지 않습니다. 키 값을 다시 확인해주세요.");
+  }
+
+  if (isQuotaExceededMessage(message)) {
+    const retryDelaySeconds = parseRetryDelaySeconds(message);
+    if (retryDelaySeconds && retryDelaySeconds > 0) {
+      return new Error(
+        `Gemini 사용량 한도를 초과했습니다. 약 ${retryDelaySeconds}초 후 다시 시도해주세요. 계속 실패하면 다른 API 키를 사용해주세요.`
+      );
+    }
+    return new Error(
+      "Gemini 사용량 한도를 초과했습니다. 잠시 후 다시 시도하거나 다른 API 키를 사용해주세요."
+    );
+  }
+
+  if (lowerMessage.includes("rate limit")) {
+    return new Error("요청이 너무 많습니다. 잠시 후 다시 시도해주세요.");
+  }
+
+  return new Error("블로그 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.");
+}
+
 export async function generateBlogPost(input: UserInput): Promise<BlogPost> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -85,11 +138,8 @@ export async function generateBlogPost(input: UserInput): Promise<BlogPost> {
     }
 
     return JSON.parse(response.text);
-  } catch (error: any) {
+  } catch (error: unknown) {
     console.error("Gemini API Error:", error);
-    if (error.message?.includes("API_KEY_INVALID")) {
-      throw new Error("API 키가 유효하지 않습니다.");
-    }
-    throw new Error(`블로그 생성 중 오류가 발생했습니다: ${error.message || "알 수 없는 오류"}`);
+    throw toUserFriendlyError(error);
   }
 }
