@@ -20,6 +20,207 @@ import { LOCATIONS, PURPOSES, LENGTH_OPTIONS, UserInput, BlogPost } from './type
 import { generateBlogPost } from './services/geminiService';
 import axios from 'axios';
 
+const MAX_IMAGES = 10;
+
+interface StructuredSectionDraft {
+  subtitle: string;
+  body: string;
+  keywords: string[];
+}
+
+interface QuoteSectionDraft {
+  quote: string;
+  philosopher: string;
+}
+
+function validateImages(imageList: string[]) {
+  if (imageList.length > MAX_IMAGES) {
+    alert('첨부 가능한 사진은 최대 10장까지입니다.');
+    return false;
+  }
+
+  if (imageList.length === 0) {
+    alert('최소 1장 이상의 사진을 선택해주세요.');
+    return false;
+  }
+
+  return true;
+}
+
+function calculatePostInfo(imageCount: number) {
+  const sectionCount = imageCount;
+  const quoteChars = 60;
+  const sectionChars = 115;
+  const hashtagChars = 90;
+
+  return {
+    sectionCount,
+    totalChars: quoteChars + sectionChars * sectionCount + hashtagChars,
+  };
+}
+
+function normalizeBodyWithSentenceBreaks(body: string) {
+  const normalized = body.replace(/\s+/g, ' ').trim();
+  const limited = normalized.length > 130 ? normalized.slice(0, 130).trim() : normalized;
+  return limited.replace(/([.!?。！？])\s*/g, '$1\n').replace(/\n{2,}/g, '\n').trim();
+}
+
+function normalizeQuoteText(quote: string) {
+  return quote.replace(/^["'“”]+|["'“”]+$/g, '').trim();
+}
+
+function parseQuoteSection(rawQuote: string): QuoteSectionDraft {
+  const cleaned = rawQuote.trim();
+  const lines = cleaned.split('\n').map((line) => line.trim()).filter(Boolean);
+  const merged = lines.join(' ');
+
+  const linePhilosopher = lines.find((line) => /[—-].+[—-]/.test(line)) || '';
+  const match = linePhilosopher.match(/[—-]\s*([^—-]+?)\s*[—-]/);
+  const philosopher = (match?.[1] || '').trim() || '작자 미상';
+
+  let quoteCandidate = lines.find((line) => line !== linePhilosopher) || merged;
+  if (quoteCandidate === linePhilosopher) quoteCandidate = '';
+  quoteCandidate = quoteCandidate.replace(/[—-]\s*[^—-]+?\s*[—-]/g, '').trim();
+  quoteCandidate = normalizeQuoteText(quoteCandidate);
+
+  if (!quoteCandidate) {
+    quoteCandidate = normalizeQuoteText(merged.replace(/[—-]\s*[^—-]+?\s*[—-]/g, ''));
+  }
+  if (!quoteCandidate) quoteCandidate = '오늘의 순간을 기록하는 마음으로 하루를 담아봅니다.';
+
+  return { quote: quoteCandidate, philosopher };
+}
+
+function extractKeywords(text: string, maxCount = 3) {
+  const stopwords = new Set([
+    '오늘',
+    '우리',
+    '그리고',
+    '그러나',
+    '정말',
+    '조금',
+    '그냥',
+    '이렇게',
+    '저렇게',
+    '무척',
+    '가장',
+    '정도',
+    '이번',
+    '하루',
+    '순간',
+    '느낌',
+    '기분',
+    '사진',
+    '기록',
+    '장면',
+  ]);
+
+  const tokens = text
+    .replace(/[^0-9A-Za-z가-힣\s]/g, ' ')
+    .split(/\s+/)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !stopwords.has(token));
+
+  const counts = new Map<string, number>();
+  tokens.forEach((token) => {
+    counts.set(token, (counts.get(token) || 0) + 1);
+  });
+
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1] || b[0].length - a[0].length)
+    .map(([token]) => token)
+    .slice(0, maxCount);
+}
+
+function escapeRegExp(text: string) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseSection(sectionText: string, index: number): StructuredSectionDraft {
+  const lines = sectionText
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const firstLine = lines[0] || `소제목 ${index + 1}`;
+  const subtitle = firstLine
+    .replace(/^#+\s*/, '')
+    .replace(/^■\s*/, '')
+    .replace(/^소제목[:：]?\s*/i, '')
+    .trim() || `소제목 ${index + 1}`;
+
+  let body = lines.slice(1).join(' ').trim();
+  if (!body) {
+    body = sectionText
+      .replace(firstLine, '')
+      .replace(/^본문[:：]?\s*/i, '')
+      .trim();
+  }
+  if (!body) body = `${subtitle}의 순간을 담은 장면입니다. 오늘의 분위기와 감정을 기록합니다.`;
+
+  return {
+    subtitle,
+    body: normalizeBodyWithSentenceBreaks(body),
+    keywords: extractKeywords(body, 3),
+  };
+}
+
+function buildStructuredSections(sections: string[], imageCount: number): StructuredSectionDraft[] {
+  const parsed = sections.map((section, idx) => parseSection(section, idx));
+  if (parsed.length >= imageCount) return parsed.slice(0, imageCount);
+
+  const filled = [...parsed];
+  while (filled.length < imageCount) {
+    const idx = filled.length;
+    filled.push({
+      subtitle: `소제목 ${idx + 1}`,
+      body: '사진의 분위기와 장면을 중심으로 오늘의 기록을 정리합니다.',
+      keywords: ['사진', '분위기', '기록'],
+    });
+  }
+  return filled;
+}
+
+function buildHashtags(seoKeywords: string[]) {
+  const unique = Array.from(
+    new Set(
+      seoKeywords
+        .map((kw) => kw.replace(/^#+/, '').trim())
+        .filter(Boolean),
+    ),
+  );
+  return unique.slice(0, 9);
+}
+
+function renderHighlightedLine(line: string, keywords: string[]) {
+  if (!line) return line;
+  const usableKeywords = keywords.filter((keyword) => keyword.trim().length > 0);
+  if (usableKeywords.length === 0) return line;
+
+  const regex = new RegExp(`(${usableKeywords.map((keyword) => escapeRegExp(keyword)).join('|')})`, 'g');
+  const parts = line.split(regex);
+
+  return parts.map((part, idx) =>
+    usableKeywords.includes(part) ? (
+      <span key={`kw-${idx}`} style={{ backgroundColor: '#FFFF00' }}>
+        {part}
+      </span>
+    ) : (
+      <React.Fragment key={`txt-${idx}`}>{part}</React.Fragment>
+    ),
+  );
+}
+
+function renderHighlightedBody(body: string, keywords: string[]) {
+  const lines = body.split('\n');
+  return lines.map((line, idx) => (
+    <React.Fragment key={`line-${idx}`}>
+      {renderHighlightedLine(line, keywords)}
+      {idx < lines.length - 1 && <br />}
+    </React.Fragment>
+  ));
+}
+
 export default function App() {
   const [images, setImages] = useState<string[]>([]);
   const [selectedLocations, setSelectedLocations] = useState<string[]>([]);
@@ -35,9 +236,14 @@ export default function App() {
   const [generatedPost, setGeneratedPost] = useState<BlogPost | null>(null);
   const [isPublishing, setIsPublishing] = useState(false);
   const [publishResult, setPublishResult] = useState<{ success: boolean; url: string } | null>(null);
+  const [isStep1Confirmed, setIsStep1Confirmed] = useState(false);
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
-    const remainingSlots = 15 - images.length;
+    if (images.length + acceptedFiles.length > MAX_IMAGES) {
+      alert('첨부 가능한 사진은 최대 10장까지입니다.');
+    }
+
+    const remainingSlots = MAX_IMAGES - images.length;
     const filesToProcess = acceptedFiles.slice(0, remainingSlots);
 
     if (filesToProcess.length === 0) return;
@@ -78,20 +284,22 @@ export default function App() {
         });
       })
     ).then(newImages => {
-      setImages(prev => [...prev, ...newImages].slice(0, 15));
+      setImages(prev => [...prev, ...newImages].slice(0, MAX_IMAGES));
+      setIsStep1Confirmed(false);
     });
   }, [images.length]);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     accept: { 'image/*': [] },
-    maxFiles: 15,
+    maxFiles: MAX_IMAGES,
     multiple: true,
-    disabled: images.length >= 15
+    disabled: images.length >= MAX_IMAGES
   } as any);
 
   const removeImage = (index: number) => {
     setImages(prev => prev.filter((_, i) => i !== index));
+    setIsStep1Confirmed(false);
   };
 
   const toggleLocation = (loc: string) => {
@@ -110,7 +318,49 @@ export default function App() {
     );
   };
 
+  const handleStep1Confirm = () => {
+    if (!validateImages(images)) return;
+    setIsStep1Confirmed(true);
+  };
+
+  const publishGeneratedPost = async (post: BlogPost) => {
+    const structuredSections = buildStructuredSections(post.sections, images.length);
+    const hashtags = buildHashtags(post.seoKeywords);
+    const quoteSection = parseQuoteSection(post.quote || '');
+    const contentLines: string[] = [];
+
+    if (quoteSection.quote) {
+      contentLines.push(`"${quoteSection.quote}"\n— ${quoteSection.philosopher} —`);
+    }
+
+    structuredSections.forEach((section) => {
+      contentLines.push(`■ ${section.subtitle}\n${section.body}`);
+    });
+
+    if (hashtags.length > 0) {
+      contentLines.push(hashtags.map((tag) => `#${tag}`).join(' '));
+    }
+
+    const response = await axios.post('/api/publish', {
+      title: post.title,
+      content: contentLines.join('\n\n'),
+      images,
+      quote: `"${quoteSection.quote}"\n— ${quoteSection.philosopher} —`,
+      sections: structuredSections,
+      hashtags,
+      blogType: 'Naver',
+    });
+
+    setPublishResult(response.data);
+  };
+
   const handleGenerate = async () => {
+    if (!validateImages(images)) return;
+    if (!isStep1Confirmed) {
+      alert('Step 1 확인 버튼을 먼저 눌러주세요.');
+      return;
+    }
+
     const finalLocations = isOtherLocation 
       ? [...selectedLocations, otherLocation].filter(l => l !== '')
       : selectedLocations;
@@ -124,43 +374,23 @@ export default function App() {
       imageCount: images.length
     });
 
-    if (images.length === 0) {
-      alert('최소 1장의 사진을 첨부해주세요!');
-      return;
-    }
-
-    if (finalLocations.length === 0) {
-      alert('장소를 최소 1개 선택하거나 입력해주세요!');
-      return;
-    }
-
-    if (finalPurposes.length === 0) {
-      alert('포스팅 목적을 최소 1개 선택해주세요!');
-      return;
-    }
-
     setIsGenerating(true);
+    setIsPublishing(false);
     setGeneratedPost(null);
     setPublishResult(null);
 
-    // Smart logic: Calculate length and sections based on images if Smart option is selected
-    let finalLength = lengthOption.value;
-    let finalSections = lengthOption.sections;
-
-    if (lengthOption.value === 0) {
-      // Smart calculation: Cap at 2000 characters
-      // Aim for roughly 2-3 images per section if there are many images
-      finalSections = Math.max(2, Math.min(8, Math.ceil(images.length / 2)));
-      finalLength = Math.min(2000, images.length * 200);
-      if (finalLength < 500) finalLength = 500;
-    }
+    const postInfo = calculatePostInfo(images.length);
+    const finalLength = postInfo.totalChars;
+    const finalSections = postInfo.sectionCount;
+    const safeLocations = finalLocations.length > 0 ? finalLocations : ['일상'];
+    const safePurposes = finalPurposes.length > 0 ? finalPurposes : ['네이버 자동 포스팅'];
 
     // Set a timeout to show different messages
     const loadingMessages = [
       '이미지를 분석하고 있습니다...',
-      `SEO 최적화된 제목을 짓고 있습니다... (목표: 약 ${finalLength}자)`,
-      '블로그 내용을 작성 중입니다...',
-      '거의 다 되었습니다!'
+      `총 섹션 ${finalSections}개 기준으로 작성 중입니다...`,
+      `총 글자수 약 ${finalLength}자 기준으로 본문을 구성 중입니다...`,
+      '네이버 블로그 자동 포스팅을 준비하고 있습니다...'
     ];
     let messageIdx = 0;
     const interval = setInterval(() => {
@@ -171,8 +401,8 @@ export default function App() {
 
     try {
       const input: UserInput = {
-        location: finalLocations,
-        purposes: finalPurposes,
+        location: safeLocations,
+        purposes: safePurposes,
         people: peopleInput,
         length: finalLength,
         sections: finalSections,
@@ -180,13 +410,20 @@ export default function App() {
       };
       const post = await generateBlogPost(input);
       setGeneratedPost(post);
+
+      setIsPublishing(true);
+      await publishGeneratedPost(post);
+      setIsPublishing(false);
+
       // Scroll to result
       setTimeout(() => {
         window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
       }, 100);
     } catch (error: any) {
-      console.error('Generation failed:', error);
-      alert(error.message || '포스팅 생성 중 오류가 발생했습니다.');
+      console.error('Generation or publishing failed:', error);
+      const serverMessage = error?.response?.data?.message;
+      alert(serverMessage || error?.message || '자동 포스팅 중 오류가 발생했습니다.');
+      setIsPublishing(false);
     } finally {
       setIsGenerating(false);
       clearInterval(interval);
@@ -195,22 +432,22 @@ export default function App() {
 
   const handlePublish = async () => {
     if (!generatedPost) return;
+    if (!validateImages(images)) return;
 
     setIsPublishing(true);
     try {
-      const response = await axios.post('/api/publish', {
-        title: generatedPost.title,
-        content: generatedPost.sections.join('\n\n'),
-        blogType: 'Naver' // Default for demo
-      });
-      setPublishResult(response.data);
-    } catch (error) {
+      await publishGeneratedPost(generatedPost);
+    } catch (error: any) {
       console.error('Publishing failed:', error);
-      alert('발행 중 오류가 발생했습니다.');
+      const serverMessage = error?.response?.data?.message;
+      alert(serverMessage || '발행 중 오류가 발생했습니다.');
     } finally {
       setIsPublishing(false);
     }
   };
+
+  const postInfo = calculatePostInfo(images.length);
+  const quoteSection = generatedPost ? parseQuoteSection(generatedPost.quote || '') : null;
 
   return (
     <div className="min-h-screen bg-[#F8F9FA] text-[#1A1A1A] font-sans pb-20">
@@ -246,11 +483,14 @@ export default function App() {
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2 text-gray-500">
                   <Target className="w-5 h-5" />
-                  <h2 className="text-sm font-semibold uppercase tracking-wider">STEP 1. 사진 첨부 ({images.length}/15)</h2>
+                  <h2 className="text-sm font-semibold uppercase tracking-wider">STEP 1. 이미지 분석 ({images.length}/{MAX_IMAGES})</h2>
                 </div>
                 {images.length > 0 && (
                   <button 
-                    onClick={() => setImages([])}
+                    onClick={() => {
+                      setImages([]);
+                      setIsStep1Confirmed(false);
+                    }}
                     className="text-xs font-bold text-red-500 hover:text-red-600 transition-colors"
                   >
                     전체 삭제
@@ -270,7 +510,7 @@ export default function App() {
                     </button>
                   </div>
                 ))}
-                {images.length < 15 && (
+                {images.length < MAX_IMAGES && (
                   <div 
                     {...getRootProps()} 
                     className={cn(
@@ -285,6 +525,22 @@ export default function App() {
                     <span className="text-xs text-gray-400 font-bold">사진 추가</span>
                   </div>
                 )}
+              </div>
+
+              <div className="rounded-2xl border border-gray-200 bg-white px-5 py-4 space-y-3 text-center">
+                <p className="text-sm font-semibold text-gray-800">총 섹션: {postInfo.sectionCount}개</p>
+                <p className="text-sm font-semibold text-gray-800">총 글자수: 약 {postInfo.totalChars}자</p>
+                <button
+                  onClick={handleStep1Confirm}
+                  className={cn(
+                    "w-full py-3 rounded-xl font-bold transition-all",
+                    isStep1Confirmed
+                      ? "bg-[#03C75A] text-white"
+                      : "bg-black text-white hover:bg-gray-900"
+                  )}
+                >
+                  {isStep1Confirmed ? '확인 완료' : '확인'}
+                </button>
               </div>
             </section>
 
@@ -438,9 +694,8 @@ export default function App() {
                   let calculatedLength = opt.value;
                   
                   if (isSmart) {
-                    calculatedSections = Math.max(2, Math.min(8, Math.ceil(images.length / 2)));
-                    calculatedLength = Math.min(2000, images.length * 200);
-                    if (calculatedLength < 500) calculatedLength = 500;
+                    calculatedSections = postInfo.sectionCount;
+                    calculatedLength = postInfo.totalChars;
                   }
                   
                   return (
@@ -467,7 +722,7 @@ export default function App() {
             {/* Generate Button */}
             <button
               onClick={handleGenerate}
-              disabled={isGenerating}
+              disabled={isGenerating || !isStep1Confirmed}
               className="w-full py-4 bg-black text-white rounded-2xl font-bold text-lg flex items-center justify-center gap-2 hover:bg-gray-900 transition-all disabled:opacity-50 disabled:cursor-not-allowed shadow-xl shadow-black/10"
             >
               {isGenerating ? (
@@ -478,7 +733,7 @@ export default function App() {
               ) : (
                 <>
                   <Send className="w-5 h-5" />
-                  블로그 포스팅 생성하기
+                  STEP 2. 네이버 블로그 자동 포스팅
                 </>
               )}
             </button>
@@ -490,7 +745,10 @@ export default function App() {
             className="space-y-8"
           >
             {/* Generated Content View */}
-            <article className="bg-white rounded-3xl p-8 shadow-sm border border-gray-100 space-y-8">
+            <article
+              className="bg-white rounded-3xl p-8 shadow-sm border border-gray-100 space-y-8"
+              style={{ wordBreak: 'keep-all', overflowWrap: 'break-word' }}
+            >
               <header className="space-y-6">
                 <div className="flex flex-wrap gap-2">
                   {generatedPost.seoKeywords.map(kw => (
@@ -498,7 +756,9 @@ export default function App() {
                   ))}
                 </div>
                 <div className="flex items-center justify-between">
-                  <h1 className="text-3xl font-black leading-tight tracking-tight flex-1">{generatedPost.title}</h1>
+                  <h1 className="text-3xl font-black leading-tight tracking-tight flex-1 text-center" style={{ wordBreak: 'keep-all', overflowWrap: 'break-word' }}>
+                    {generatedPost.title}
+                  </h1>
                   <div className="ml-4 px-3 py-1 bg-black/5 rounded-full shrink-0">
                     <span className="text-[10px] font-bold text-gray-500 uppercase">
                       약 {generatedPost.sections.join('').length}자
@@ -507,91 +767,35 @@ export default function App() {
                 </div>
                 <div className="relative py-8 px-10 bg-gray-50 rounded-2xl">
                   <Quote className="absolute top-4 left-4 w-6 h-6 text-gray-200" />
-                  <p className="text-lg font-serif italic text-center text-gray-700 leading-relaxed">
-                    {generatedPost.quote}
+                  <p className="text-lg font-serif italic text-center text-gray-700 leading-relaxed whitespace-pre-wrap" style={{ wordBreak: 'keep-all', overflowWrap: 'break-word' }}>
+                    "{quoteSection?.quote || ''}"
+                    {'\n'}
+                    — {quoteSection?.philosopher || '작자 미상'} —
                   </p>
                 </div>
               </header>
 
               <div className="space-y-12">
-                {generatedPost.sections.map((section, idx) => {
-                  // Split the section by [IMAGE_X] tags
-                  const parts = section.split(/(\[IMAGE_\d+\])/);
-                  // Group consecutive image tags to render them in a grid
-                  const renderedParts: React.ReactNode[] = [];
-                  let currentImageGroup: number[] = [];
-
-                  parts.forEach((part, i) => {
-                    const match = part.match(/\[IMAGE_(\d+)\]/);
-                    if (match) {
-                      const imgIdx = parseInt(match[1]) - 1;
-                      if (images[imgIdx]) {
-                        currentImageGroup.push(imgIdx);
-                      }
-                    } else {
-                      // If we have a pending image group, render it
-                      if (currentImageGroup.length > 0) {
-                        const group = [...currentImageGroup];
-                        renderedParts.push(
-                          <div key={`group-${i}`} className={cn(
-                            "my-8 grid gap-4",
-                            group.length === 1 ? "grid-cols-1" : 
-                            group.length === 2 ? "grid-cols-2" : "grid-cols-2 sm:grid-cols-3"
-                          )}>
-                            {group.map((idx) => (
-                              <div key={idx} className="rounded-2xl overflow-hidden shadow-lg aspect-[4/3]">
-                                <img 
-                                  src={images[idx]} 
-                                  alt={`Blog image ${idx + 1}`} 
-                                  className="w-full h-full object-cover"
-                                  referrerPolicy="no-referrer"
-                                />
-                              </div>
-                            ))}
-                          </div>
-                        );
-                        currentImageGroup = [];
-                      }
-                      
-                      if (part.trim()) {
-                        renderedParts.push(
-                          <p key={i} className="text-gray-700 leading-relaxed text-lg whitespace-pre-wrap mb-6">
-                            {part}
-                          </p>
-                        );
-                      }
-                    }
-                  });
-
-                  // Final check for trailing images
-                  if (currentImageGroup.length > 0) {
-                    const group = [...currentImageGroup];
-                    renderedParts.push(
-                      <div key="group-final" className={cn(
-                        "my-8 grid gap-4",
-                        group.length === 1 ? "grid-cols-1" : 
-                        group.length === 2 ? "grid-cols-2" : "grid-cols-2 sm:grid-cols-3"
-                      )}>
-                        {group.map((idx) => (
-                          <div key={idx} className="rounded-2xl overflow-hidden shadow-lg aspect-[4/3]">
-                            <img 
-                              src={images[idx]} 
-                              alt={`Blog image ${idx + 1}`} 
-                              className="w-full h-full object-cover"
-                              referrerPolicy="no-referrer"
-                            />
-                          </div>
-                        ))}
+                {buildStructuredSections(generatedPost.sections, images.length).map((section, idx) => (
+                  <section key={idx} className="space-y-4">
+                    {images[idx] && (
+                      <div className="rounded-2xl overflow-hidden shadow-lg aspect-[4/3]">
+                        <img
+                          src={images[idx]}
+                          alt={`Blog image ${idx + 1}`}
+                          className="w-full h-full object-cover"
+                          referrerPolicy="no-referrer"
+                        />
                       </div>
-                    );
-                  }
-
-                  return (
-                    <section key={idx} className="space-y-2">
-                      {renderedParts}
-                    </section>
-                  );
-                })}
+                    )}
+                    <h3 className="text-center font-bold text-[133%]" style={{ wordBreak: 'keep-all', overflowWrap: 'break-word' }}>
+                      ■ {section.subtitle}
+                    </h3>
+                    <p className="text-gray-700 leading-relaxed text-lg whitespace-pre-wrap text-center" style={{ wordBreak: 'keep-all', overflowWrap: 'break-word' }}>
+                      {renderHighlightedBody(section.body, section.keywords)}
+                    </p>
+                  </section>
+                ))}
               </div>
             </article>
 

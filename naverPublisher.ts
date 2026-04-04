@@ -27,6 +27,13 @@ interface PublishRequest {
   title: string;
   content: string;
   images?: string[];
+  quote?: string;
+  sections?: Array<{
+    subtitle: string;
+    body: string;
+    keywords?: string[];
+  }>;
+  hashtags?: string[];
 }
 
 interface PublishPipelineResult {
@@ -1261,6 +1268,393 @@ async function insertParagraphGap(page: Page) {
   await page.waitForTimeout(70);
 }
 
+function sanitizeSubtitleText(text: string, sectionIndex: number) {
+  const normalized = sanitizeContent(text)
+    .replace(/^#+\s*/, "")
+    .replace(/^■\s*/, "")
+    .replace(/^소제목[:：]?\s*/i, "")
+    .trim();
+  return normalized || `소제목 ${sectionIndex + 1}`;
+}
+
+function normalizeBodyTextForSection(text: string) {
+  const normalized = sanitizeContent(text).replace(/\s+/g, " ").trim();
+  const limited = normalized.length > 130 ? normalized.slice(0, 130).trim() : normalized;
+  return limited
+    .replace(/([.!?。！？])\s*/g, "$1\n")
+    .replace(/\n{2,}/g, "\n")
+    .trim();
+}
+
+function normalizeSectionsForImageCount(request: PublishRequest, imageCount: number) {
+  const sourceSections = Array.isArray(request.sections) ? request.sections : [];
+  const normalized = sourceSections.map((section, index) => {
+    const subtitle = sanitizeSubtitleText(typeof section?.subtitle === "string" ? section.subtitle : "", index);
+    const rawBody = typeof section?.body === "string" ? section.body : "";
+    const body = normalizeBodyTextForSection(rawBody || `${subtitle}의 장면을 중심으로 오늘의 분위기를 정리합니다.`);
+    const rawKeywords = Array.isArray(section?.keywords) ? section.keywords : [];
+    const keywords = rawKeywords
+      .map((keyword) => sanitizeContent(String(keyword || "")).trim())
+      .filter(Boolean)
+      .slice(0, 3);
+    return { subtitle, body, keywords };
+  });
+
+  if (normalized.length >= imageCount) return normalized.slice(0, imageCount);
+
+  const filled = [...normalized];
+  while (filled.length < imageCount) {
+    const idx = filled.length;
+    const subtitle = `소제목 ${idx + 1}`;
+    filled.push({
+      subtitle,
+      body: normalizeBodyTextForSection("사진의 분위기와 장면을 중심으로 오늘의 감정을 기록합니다."),
+      keywords: [],
+    });
+  }
+
+  return filled;
+}
+
+async function applyStyleToLatestTextBlock(
+  page: Page,
+  style: {
+    textAlign?: "left" | "center" | "right";
+    fontWeight?: string;
+    fontSize?: string;
+    wordBreak?: string;
+    overflowWrap?: string;
+  },
+) {
+  const applyInRoot = async (root: Page | Frame) => {
+    try {
+      return await root.evaluate((targetStyle) => {
+        const selectors = [
+          ".se-main-container .se-section-text .se-module-text",
+          ".se-main-container .se-text-paragraph",
+          ".se-section-text .se-module-text",
+          ".se-text-paragraph",
+          ".se-module-text",
+          "p",
+        ];
+
+        const candidates: HTMLElement[] = [];
+        const visited = new Set<HTMLElement>();
+        for (const selector of selectors) {
+          const nodes = Array.from(document.querySelectorAll(selector));
+          for (const node of nodes) {
+            if (!(node instanceof HTMLElement)) continue;
+            if (visited.has(node)) continue;
+            visited.add(node);
+            candidates.push(node);
+          }
+        }
+
+        const visible = candidates.filter((el) => {
+          const rect = el.getBoundingClientRect();
+          const css = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && css.display !== "none" && css.visibility !== "hidden";
+        });
+
+        const target = visible[visible.length - 1] || candidates[candidates.length - 1];
+        if (!target) return false;
+
+        if (targetStyle.textAlign) target.style.textAlign = targetStyle.textAlign;
+        if (targetStyle.fontWeight) target.style.fontWeight = targetStyle.fontWeight;
+        if (targetStyle.fontSize) target.style.fontSize = targetStyle.fontSize;
+        if (targetStyle.wordBreak) target.style.wordBreak = targetStyle.wordBreak;
+        if (targetStyle.overflowWrap) target.style.overflowWrap = targetStyle.overflowWrap;
+        return true;
+      }, style);
+    } catch {
+      return false;
+    }
+  };
+
+  if (await applyInRoot(page)) return true;
+  for (const frame of page.frames()) {
+    if (await applyInRoot(frame)) return true;
+  }
+  return false;
+}
+
+function parseQuoteAndPhilosopher(rawQuote: string) {
+  const cleaned = sanitizeContent(rawQuote).trim();
+  if (!cleaned) {
+    return { quote: "오늘의 순간을 기록하는 마음으로 하루를 담아봅니다.", philosopher: "작자 미상" };
+  }
+
+  const lines = cleaned.split("\n").map((line) => line.trim()).filter(Boolean);
+  const lineWithPhilosopher = lines.find((line) => /[—-].+[—-]/.test(line)) || "";
+  const nameMatch = lineWithPhilosopher.match(/[—-]\s*([^—-]+?)\s*[—-]/);
+  const philosopher = (nameMatch?.[1] || "").trim() || "작자 미상";
+
+  let quote = lines.find((line) => line !== lineWithPhilosopher) || cleaned;
+  quote = quote.replace(/[—-]\s*[^—-]+?\s*[—-]/g, "").trim();
+  quote = quote.replace(/^["'“”]+|["'“”]+$/g, "").trim();
+  if (!quote) quote = "오늘의 순간을 기록하는 마음으로 하루를 담아봅니다.";
+
+  return { quote, philosopher };
+}
+
+async function highlightKeywordsInLatestTextBlocks(page: Page, keywords: string[], recentBlockCount: number) {
+  const usableKeywords = Array.from(
+    new Set(
+      keywords
+        .map((keyword) => sanitizeContent(keyword).trim())
+        .filter((keyword) => keyword.length > 0),
+    ),
+  ).slice(0, 3);
+
+  if (usableKeywords.length === 0) return true;
+
+  const applyInRoot = async (root: Page | Frame) => {
+    try {
+      return await root.evaluate(
+        ({ selectedKeywords, blockCount }) => {
+          const selectors = [
+            ".se-main-container .se-section-text .se-module-text",
+            ".se-main-container .se-text-paragraph",
+            ".se-section-text .se-module-text",
+            ".se-text-paragraph",
+            ".se-module-text",
+            "p",
+          ];
+
+          const candidates: HTMLElement[] = [];
+          const visited = new Set<HTMLElement>();
+          for (const selector of selectors) {
+            const nodes = Array.from(document.querySelectorAll(selector));
+            for (const node of nodes) {
+              if (!(node instanceof HTMLElement)) continue;
+              if (visited.has(node)) continue;
+              visited.add(node);
+              candidates.push(node);
+            }
+          }
+
+          const visible = candidates.filter((el) => {
+            const rect = el.getBoundingClientRect();
+            const css = window.getComputedStyle(el);
+            return rect.width > 0 && rect.height > 0 && css.display !== "none" && css.visibility !== "hidden";
+          });
+
+          const targetBlocks = visible.slice(Math.max(0, visible.length - Math.max(1, blockCount)));
+          if (!targetBlocks.length) return false;
+
+          const highlightOneKeyword = (container: HTMLElement, keyword: string) => {
+            const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+            const textNodes: Text[] = [];
+            let current = walker.nextNode();
+            while (current) {
+              if (current.nodeType === Node.TEXT_NODE) {
+                const textNode = current as Text;
+                if ((textNode.nodeValue || "").trim()) textNodes.push(textNode);
+              }
+              current = walker.nextNode();
+            }
+
+            for (const textNode of textNodes) {
+              const source = textNode.nodeValue || "";
+              const index = source.indexOf(keyword);
+              if (index < 0) continue;
+
+              const before = source.slice(0, index);
+              const matched = source.slice(index, index + keyword.length);
+              const after = source.slice(index + keyword.length);
+
+              const fragment = document.createDocumentFragment();
+              if (before) fragment.appendChild(document.createTextNode(before));
+
+              const marker = document.createElement("span");
+              marker.style.backgroundColor = "#FFFF00";
+              marker.textContent = matched;
+              fragment.appendChild(marker);
+
+              if (after) fragment.appendChild(document.createTextNode(after));
+              textNode.parentNode?.replaceChild(fragment, textNode);
+              return true;
+            }
+
+            return false;
+          };
+
+          for (const keyword of selectedKeywords) {
+            for (const block of targetBlocks) {
+              if (highlightOneKeyword(block, keyword)) break;
+            }
+          }
+
+          return true;
+        },
+        { selectedKeywords: usableKeywords, blockCount: recentBlockCount },
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  if (await applyInRoot(page)) return true;
+  for (const frame of page.frames()) {
+    if (await applyInRoot(frame)) return true;
+  }
+  return false;
+}
+
+async function insertFormattedSubtitle(page: Page, subtitle: string) {
+  await moveCaretToEditorEnd(page);
+  await page.keyboard.insertText(`■ ${subtitle}`);
+  await page.waitForTimeout(50);
+  await applyStyleToLatestTextBlock(page, {
+    textAlign: "center",
+    fontWeight: "700",
+    fontSize: "133%",
+    wordBreak: "keep-all",
+    overflowWrap: "break-word",
+  });
+}
+
+async function insertFormattedBody(page: Page, body: string, keywords: string[]) {
+  const lines = body
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const chunks = lines.length ? lines : ["사진의 장면을 중심으로 오늘의 감정을 기록합니다."];
+  for (let i = 0; i < chunks.length; i += 1) {
+    await moveCaretToEditorEnd(page);
+    await page.keyboard.insertText(chunks[i]);
+    await page.waitForTimeout(40);
+    await applyStyleToLatestTextBlock(page, {
+      textAlign: "center",
+      wordBreak: "keep-all",
+      overflowWrap: "break-word",
+    });
+    if (i < chunks.length - 1) {
+      await page.keyboard.press("Enter").catch(() => {});
+      await page.waitForTimeout(60);
+    }
+  }
+
+  await highlightKeywordsInLatestTextBlocks(page, keywords, chunks.length).catch(() => {});
+  return chunks.length;
+}
+
+function normalizeHashtags(tags: string[]) {
+  const cleaned = tags
+    .map((tag) => tag.replace(/^#+/, "").replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  const unique = Array.from(new Set(cleaned));
+  return unique.slice(0, 9);
+}
+
+async function fillContentAndInsertImagesBySectionStructure(page: Page, request: PublishRequest, imagePaths: string[]) {
+  if (!imagePaths.length) return false;
+
+  const sections = normalizeSectionsForImageCount(request, imagePaths.length);
+  if (sections.length !== imagePaths.length) return false;
+
+  await dismissBlockingEditorPopup(page);
+  const contentLocator = await focusContentEditorLocator(page);
+  if (!contentLocator) return false;
+
+  await contentLocator.click({ timeout: 800 }).catch(() => contentLocator.click({ timeout: 800, force: true }));
+  await page.keyboard.press("Meta+A").catch(() => {});
+  await page.keyboard.press("Control+A").catch(() => {});
+  await page.keyboard.press("Backspace").catch(() => {});
+  await page.waitForTimeout(120);
+
+  let previousCount = await countEditorImages(page);
+  let insertedImages = 0;
+  const expectedParts: string[] = [];
+
+  const rawQuote = typeof request.quote === "string" ? request.quote : "";
+  if (rawQuote.trim()) {
+    const quoteSection = parseQuoteAndPhilosopher(rawQuote);
+
+    await moveCaretToEditorEnd(page);
+    await page.keyboard.insertText(`"${quoteSection.quote}"`);
+    await page.waitForTimeout(60);
+    await applyStyleToLatestTextBlock(page, {
+      textAlign: "center",
+      wordBreak: "keep-all",
+      overflowWrap: "break-word",
+    });
+    expectedParts.push(quoteSection.quote);
+
+    await page.keyboard.press("Enter").catch(() => {});
+    await page.waitForTimeout(60);
+    await moveCaretToEditorEnd(page);
+    await page.keyboard.insertText(`— ${quoteSection.philosopher} —`);
+    await page.waitForTimeout(60);
+    await applyStyleToLatestTextBlock(page, {
+      textAlign: "center",
+      wordBreak: "keep-all",
+      overflowWrap: "break-word",
+    });
+    expectedParts.push(quoteSection.philosopher);
+
+    await insertParagraphGap(page);
+  }
+
+  for (let i = 0; i < imagePaths.length; i += 1) {
+    const imagePath = imagePaths[i];
+    const section = sections[i];
+    if (!imagePath || !section) return false;
+
+    await moveCaretToEditorEnd(page);
+    const currentCount = await uploadImageAtCursorAndVerify(page, imagePath, previousCount);
+    if (currentCount < 0) return false;
+    previousCount = currentCount;
+    insertedImages += 1;
+
+    await insertParagraphGap(page);
+    await insertFormattedSubtitle(page, section.subtitle);
+    expectedParts.push(section.subtitle);
+
+    await page.keyboard.press("Enter").catch(() => {});
+    await page.waitForTimeout(60);
+    await insertFormattedBody(page, section.body, section.keywords || []);
+    expectedParts.push(section.body);
+
+    await insertParagraphGap(page);
+    await insertParagraphGap(page);
+  }
+
+  const hashtagSource = Array.isArray(request.hashtags) ? request.hashtags : [];
+  const hashtags = normalizeHashtags(hashtagSource);
+  if (hashtags.length > 0) {
+    const firstLine = hashtags.slice(0, 5).map((tag) => `#${tag}`).join(" ");
+    const secondLine = hashtags.slice(5).map((tag) => `#${tag}`).join(" ");
+
+    await moveCaretToEditorEnd(page);
+    await page.keyboard.insertText(firstLine);
+    await page.waitForTimeout(40);
+    await applyStyleToLatestTextBlock(page, {
+      textAlign: "center",
+      wordBreak: "keep-all",
+      overflowWrap: "break-word",
+    });
+    expectedParts.push(firstLine);
+
+    if (secondLine) {
+      await page.keyboard.press("Enter").catch(() => {});
+      await page.waitForTimeout(60);
+      await page.keyboard.insertText(secondLine);
+      await page.waitForTimeout(40);
+      await applyStyleToLatestTextBlock(page, {
+        textAlign: "center",
+        wordBreak: "keep-all",
+        overflowWrap: "break-word",
+      });
+      expectedParts.push(secondLine);
+    }
+  }
+
+  if (insertedImages !== imagePaths.length) return false;
+  return verifyEditorHasExpectedText(page, expectedParts.join("\n\n"));
+}
+
 async function verifyEditorHasExpectedText(page: Page, expectedRawText: string) {
   const expected = normalizeComparableText(expectedRawText);
   if (!expected) return false;
@@ -2257,9 +2651,16 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
     }
 
     tempImageFiles = prepareImageFiles(request.images || []);
-    const contentOk = tempImageFiles.length > 0
-      ? await fillContentAndInsertImagesByParagraphPlan(page, request.content, tempImageFiles)
-      : await fillContent(page, request.content);
+    const canUseSectionStructure =
+      tempImageFiles.length > 0 &&
+      Array.isArray(request.sections) &&
+      request.sections.length === tempImageFiles.length;
+
+    const contentOk = canUseSectionStructure
+      ? await fillContentAndInsertImagesBySectionStructure(page, request, tempImageFiles)
+      : tempImageFiles.length > 0
+        ? await fillContentAndInsertImagesByParagraphPlan(page, request.content, tempImageFiles)
+        : await fillContent(page, request.content);
 
     if (!contentOk) {
       if (tempImageFiles.length > 0) {
@@ -2270,7 +2671,9 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
           postUrl: "",
           contentLength: 0,
           screenshotPath,
-          message: "이미지를 단락과 단락 사이에 배치하는 중 실패했습니다.",
+          message: canUseSectionStructure
+            ? "섹션 구조(이미지/소제목/본문) 작성 중 실패했습니다."
+            : "이미지를 단락과 단락 사이에 배치하는 중 실패했습니다.",
         });
       }
 
@@ -2304,7 +2707,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
           postUrl: "",
           contentLength: 0,
           screenshotPath,
-          message: "이미지가 본문 단락 경계에 충분히 삽입되지 않았습니다.",
+          message: "이미지가 섹션 수에 맞게 충분히 삽입되지 않았습니다.",
         });
       }
     }
@@ -2344,7 +2747,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
           postUrl: "",
           contentLength: 0,
           screenshotPath,
-          message: "발행 직전 이미지 배치가 유지되지 않아 중단했습니다.",
+          message: "발행 직전 이미지 섹션 배치가 유지되지 않아 중단했습니다.",
         });
       }
     }

@@ -82,32 +82,35 @@ export async function generateBlogPost(input: UserInput): Promise<BlogPost> {
 
   const textPart = {
     text: `
-      You are an expert SEO blog writer specializing in high-quality Korean blog posts that rank high on search engines (Naver, Google).
-      Generate a blog post based on the following information and the provided images:
+      You are an expert Korean blog writer for Naver autoposting.
+      Generate a structured post based on the following information and the provided images:
       - Location: ${input.location.join(", ")}
       - Purposes: ${input.purposes.join(", ")}
       - People in photos: ${input.people || "None specified"}
-      - Target length: ${input.length} characters (excluding spaces). **STRICT LIMIT: DO NOT EXCEED 2,000 CHARACTERS.**
-      - Number of sections: ${input.sections}
+      - Target length: around ${input.length} characters
+      - Number of sections: exactly ${input.sections}
       - Number of images: ${input.images.length}
 
-      SEO Writing Guidelines:
-      1. Title: Create a high-CTR, SEO-optimized title. Use power words and numbers if appropriate.
-      2. Structure: Use a clear introduction, body sections with subheadings, and a conclusion.
-      3. Content: Write in a natural, engaging, and helpful tone. Avoid repetitive phrases.
-      4. Image Integration: 
-         - Analyze each image carefully.
-         - Place [IMAGE_1], [IMAGE_2], etc., where they naturally fit the narrative.
-         - **IMAGE GROUPING**: For longer posts (near 2,000 characters), you may group 2 or 3 images together (e.g., [IMAGE_1][IMAGE_2] or [IMAGE_1][IMAGE_2][IMAGE_3]) between paragraphs or sections to maintain visual flow and prevent the text from feeling too dense.
-         - Describe the visual details from the photos in the surrounding text to improve relevance.
-      5. Keywords: Naturally incorporate relevant keywords throughout the text.
-      6. Formatting: Use bullet points or numbered lists where it makes sense to improve readability.
+      Core Rules:
+      1. Image count = section count. (1 image per section)
+      2. Each section must follow this exact structure:
+         - first line: subtitle only (about 15 Korean characters)
+         - second+ lines: body text only (about 100 Korean characters)
+      3. Body priority: image scene details > season context > date mood.
+      4. Body sentences must be easy to split by periods.
+      5. Do not include [IMAGE_X] markers.
+      6. Keep all writing natural Korean for Naver blog readers.
 
       Response Requirements:
-      1. Title: Catchy and SEO-friendly.
-      2. Quote: A meaningful opening quote that sets the mood.
-      3. Sections: Exactly ${input.sections} sections. Each section should start with a clear subheading (e.g., "## Subheading").
-      4. SEO Keywords: Provide 5-10 specific keywords used for this post.
+      1. title: catchy Korean title.
+      2. quote: must be exactly this 2-line format:
+         "quote sentence"
+         — philosopher name —
+      3. sections: exactly ${input.sections} items.
+         - each section string format:
+           subtitle line + newline + body line(s)
+         - do not include section numbers like "섹션 1", "섹션 2".
+      4. seoKeywords: exactly 9 hashtag keywords without #.
 
       Return the response in JSON format.
     `

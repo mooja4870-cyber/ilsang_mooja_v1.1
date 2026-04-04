@@ -149,7 +149,7 @@ async function startServer() {
   });
 
   app.post("/api/publish", async (req, res) => {
-    const { title, content, images } = req.body || {};
+    const { title, content, images, quote, sections, hashtags } = req.body || {};
     const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
 
     if (!title || !normalizedContent) {
@@ -162,7 +162,14 @@ async function startServer() {
     }
 
     try {
-      const result = await publishToNaver({ title, content: normalizedContent, images });
+      const result = await publishToNaver({
+        title,
+        content: normalizedContent,
+        images,
+        quote,
+        sections,
+        hashtags,
+      });
       if (!result.ok) {
         return res.status(500).json({
           success: false,
