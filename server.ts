@@ -162,19 +162,21 @@ async function startServer() {
   });
 
   app.post("/api/publish", async (req, res) => {
-    const { title, content, images, quote, quoteText, quoteAuthor, sections, hashtags } = req.body || {};
-    const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
-
-    if (!title || !normalizedContent) {
-      return res.status(400).json({
-        success: false,
-        reason: "POST_FAIL",
-        message: "title과 content는 필수입니다.",
-        url: "",
-      });
-    }
-
     try {
+      const { title, content, images, quote, quoteText, quoteAuthor, sections, hashtags } = req.body || {};
+      const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
+
+      if (!title || !normalizedContent) {
+        return res.status(400).json({
+          success: false,
+          reason: "POST_FAIL",
+          message: "title과 content는 필수입니다.",
+          url: "",
+        });
+      }
+
+      console.log(`\x1b[36m[POSTING]\x1b[0m Publishing to Naver... (Images: ${images?.length || 0})`);
+      
       const result = await publishToNaver({
         title,
         content: normalizedContent,
@@ -185,17 +187,8 @@ async function startServer() {
         sections,
         hashtags,
       });
-      if (!result.ok) {
-        return res.status(500).json({
-          success: false,
-          reason: result.reason,
-          message: result.message,
-          screenshotPath: result.screenshotPath || "",
-          tracePath: result.tracePath || "",
-          url: result.postUrl || "",
-          contentLength: result.contentLength || 0,
-        });
-      }
+
+      console.log(`\x1b[32m[SUCCESS]\x1b[0m Blog published: ${result.postUrl || 'Success'}`);
 
       return res.json({
         success: true,
@@ -206,7 +199,7 @@ async function startServer() {
         contentLength: result.contentLength,
       });
     } catch (error: any) {
-      console.error("Naver publish error:", error);
+      console.error("\x1b[31m[ERROR]\x1b[0m Naver publish failed:", error.message);
       return res.status(500).json({
         success: false,
         reason: "UNKNOWN",
