@@ -334,8 +334,22 @@ async function startServer() {
     });
   }
 
-  const server = app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  const server = app.listen(PORT, "0.0.0.0", async () => {
+    console.log(`\x1b[32m[LOCAL]\x1b[0m Server running on http://localhost:${PORT}`);
+    
+    // --- 근본 해결: HTTPS 터널 생성 ---
+    try {
+      const localtunnel = (await import('localtunnel')).default;
+      const tunnel = await localtunnel({ port: PORT });
+      console.log(`\x1b[35m[HTTPS]\x1b[0m Your secure public URL: \x1b[1m${tunnel.url}\x1b[0m`);
+      console.log(`\x1b[33m[TIP]\x1b[0m Copy this URL to the [Settings] modal in myilsang.streamlit.app to CONNECT!`);
+      
+      tunnel.on('close', () => {
+        console.log('Tunnel closed');
+      });
+    } catch (err) {
+      console.error('Failed to create HTTPS tunnel:', err);
+    }
   });
 
   // Graceful shutdown: clean up browser resources
