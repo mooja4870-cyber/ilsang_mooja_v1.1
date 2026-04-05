@@ -525,6 +525,7 @@ export default function App() {
   const [isBackendReady, setIsBackendReady] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isMixedErrorOpen, setIsMixedErrorOpen] = useState(false);
+  const [serverConfig, setServerConfig] = useState<{ geminiApiKey?: string }>({});
 
   // 백엔드 상태 주기적 체크
   const checkBackend = useCallback(async () => {
@@ -533,8 +534,16 @@ export default function App() {
         timeout: 2000,
         headers: { 'Bypass-Tunnel-Reminder': 'true' }
       });
-      if (resp.status === 200) setIsBackendReady(true);
-      else setIsBackendReady(false);
+      if (resp.status === 200) {
+        setIsBackendReady(true);
+        if (resp.data?.geminiApiKey) {
+          setServerConfig(resp.data);
+          // 전역 window 객체에도 백업용으로 저장
+          (window as any).GEMINI_API_KEY = resp.data.geminiApiKey;
+        }
+      } else {
+        setIsBackendReady(false);
+      }
     } catch {
       setIsBackendReady(false);
     }
@@ -717,7 +726,7 @@ export default function App() {
         sections: finalSections,
         images
       };
-      const post = await generateBlogPost(input);
+      const post = await generateBlogPost(input, serverConfig.geminiApiKey);
       setIsPublishing(true);
       const publishData = await publishGeneratedPost(post);
       setIsPublishing(false);
@@ -740,10 +749,21 @@ export default function App() {
         window.scrollTo({ top: document.body.scrollHeight, behavior: 'smooth' });
       }, 100);
     } catch (error: any) {
-      console.error('Generation or publishing failed:', error);
-      const serverMessage = error?.response?.data?.message;
-      alert(serverMessage || error?.message || '자동 포스팅 중 오류가 발생했습니다.');
+      console.error('AI 블로그 생성/발행 실패 상세 정보:', error);
+      clearInterval(interval);
+      setIsGenerating(false);
       setIsPublishing(false);
+      
+      const errorMessage = error?.message || '';
+      const serverMessage = error?.response?.data?.message;
+      
+      if (errorMessage.includes('API_KEY')) {
+        alert('Gemini API 키가 올바르지 않습니다. .env.local 설정을 확인해주세요.');
+      } else if (errorMessage.includes('Too Many Requests') || errorMessage.includes('429')) {
+        alert('Gemini API 사용량을 초과했습니다. 잠시 후 다시 시도해 주세요.');
+      } else {
+        alert(serverMessage || errorMessage || '블로그 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
+      }
     } finally {
       setIsGenerating(false);
       clearInterval(interval);

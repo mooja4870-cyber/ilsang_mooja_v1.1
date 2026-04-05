@@ -72,10 +72,10 @@ function toUserFriendlyError(error: unknown): Error {
   return new Error("블로그 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.");
 }
 
-export async function generateBlogPost(input: UserInput): Promise<BlogPost> {
-  const apiKey = process.env.GEMINI_API_KEY;
+export async function generateBlogPost(input: UserInput, dynamicApiKey?: string): Promise<BlogPost> {
+  const apiKey = dynamicApiKey || process.env.GEMINI_API_KEY || (window as any).GEMINI_API_KEY;
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY가 설정되지 않았습니다. 환경 변수를 확인해주세요.");
+    throw new Error("API 키가 없습니다. 설정에서 서버 주소를 확인하거나 .env.local 설정을 확인해주세요.");
   }
 
   const ai = new GoogleGenAI({ apiKey });
