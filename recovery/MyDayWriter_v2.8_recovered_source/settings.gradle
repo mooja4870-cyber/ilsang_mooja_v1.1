@@ -1,0 +1,3 @@
+rootProject.name = 'MyDayWriter_v2.8_recovered'
+
+include 'app'

@@ -1,0 +1,3 @@
+rootProject.name = 'MyDay Writernv2.8'
+
+include 'app'

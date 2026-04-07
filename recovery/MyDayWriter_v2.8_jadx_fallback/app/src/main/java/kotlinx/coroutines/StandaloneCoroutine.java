@@ -1,0 +1,22 @@
+package kotlinx.coroutines;
+
+/* JADX INFO: compiled from: Builders.common.kt */
+/* JADX INFO: loaded from: classes.dex */
+@kotlin.Metadata(d1 = {"\u0000\"\n\u0002\u0018\u0002\n\u0002\u0018\u0002\n\u0002\u0010\u0002\n\u0000\n\u0002\u0018\u0002\n\u0000\n\u0002\u0010\u000b\n\u0002\b\u0003\n\u0002\u0010\u0003\n\u0000\b\u0012\u0018\u00002\b\u0012\u0004\u0012\u00020\u00020\u0001B\u0015\u0012\u0006\u0010\u0003\u001a\u00020\u0004\u0012\u0006\u0010\u0005\u001a\u00020\u0006¢\u0006\u0002\u0010\u0007J\u0010\u0010\b\u001a\u00020\u00062\u0006\u0010\t\u001a\u00020\nH\u0014¨\u0006\u000b"}, d2 = {"Lkotlinx/coroutines/StandaloneCoroutine;", "Lkotlinx/coroutines/AbstractCoroutine;", "", "parentContext", "Lkotlin/coroutines/CoroutineContext;", "active", "", "(Lkotlin/coroutines/CoroutineContext;Z)V", "handleJobException", "exception", "", "kotlinx-coroutines-core"}, k = 1, mv = {1, 9, 0}, xi = 48)
+class StandaloneCoroutine extends kotlinx.coroutines.AbstractCoroutine<kotlin.Unit> {
+    public StandaloneCoroutine(kotlin.coroutines.CoroutineContext r2, boolean r3) {
+            r1 = this;
+            r0 = 1
+            r1.<init>(r2, r0, r3)
+            return
+    }
+
+    @Override // kotlinx.coroutines.JobSupport
+    protected boolean handleJobException(java.lang.Throwable r2) {
+            r1 = this;
+            kotlin.coroutines.CoroutineContext r0 = r1.getContext()
+            kotlinx.coroutines.CoroutineExceptionHandlerKt.handleCoroutineException(r0, r2)
+            r0 = 1
+            return r0
+    }
+}

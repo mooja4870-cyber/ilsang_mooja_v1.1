@@ -1,0 +1,10 @@
+package org.apache.cordova;
+
+/* JADX INFO: loaded from: classes5.dex */
+public final class R {
+    private R() {
+            r0 = this;
+            r0.<init>()
+            return
+    }
+}
