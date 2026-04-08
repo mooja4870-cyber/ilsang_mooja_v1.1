@@ -624,6 +624,19 @@ async function startServer() {
     const sampleTitle = "[테스트] 네이버 자동 발행 샘플";
     const sampleContent =
       "오늘은 네이버 자동 발행 기능을 점검하기 위한 테스트 글입니다. 로그인 후 제목, 본문, 이미지 입력과 발행 단계가 정상 완료되는지 확인합니다.";
+    const parsedCredentials = parseRequestCredentials(req.body);
+
+    if (!parsedCredentials.credentials) {
+      return res.status(400).json({
+        success: false,
+        reason: "INVALID_CREDENTIALS",
+        message:
+          parsedCredentials.provided
+            ? "요청 계정 정보가 불완전합니다. 네이버 아이디/비밀번호/블로그 아이디를 모두 입력해주세요."
+            : "요청 계정 정보가 없습니다. 네이버 아이디/비밀번호/블로그 아이디를 입력해주세요.",
+        url: "",
+      });
+    }
 
     const sampleImages = [
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAADICAIAAABJdyC1AAABdElEQVR4nO3UQQ0AIBDAMMC/58MCP7KkVbDX9swZAIDvM+8AAPyZsQABAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBD4B8M2A7uKXu95AAAAAElFTkSuQmCC",
@@ -635,6 +648,7 @@ async function startServer() {
         title: sampleTitle,
         content: sampleContent,
         images: sampleImages,
+        credentials: parsedCredentials.credentials,
       });
 
       if (!result.ok) {
@@ -654,6 +668,7 @@ async function startServer() {
         reason: result.reason,
         message: result.message,
         url: result.postUrl,
+        targetBlogId: parsedCredentials.credentials.blogId,
         contentLength: result.contentLength,
       });
     } catch (error: any) {
