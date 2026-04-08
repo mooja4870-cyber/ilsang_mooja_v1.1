@@ -27,14 +27,7 @@ interface PublishRequest {
   title: string;
   content: string;
   images?: string[];
-  credentials?: {
-    username?: string;
-    password?: string;
-    blogId?: string;
-    naverUsername?: string;
-    naverPassword?: string;
-    naverBlogId?: string;
-  };
+  credentials: Credentials;
   quote?: string;
   quoteText?: string;
   quoteAuthor?: string;
@@ -301,45 +294,16 @@ function isRetryableReason(reason: ReasonCode) {
   ].includes(reason);
 }
 
-function normalizeCredentialText(value: unknown) {
-  return typeof value === "string" ? value.trim() : "";
-}
-
-function normalizeCredentialBlogId(value: unknown) {
-  const raw = normalizeCredentialText(value);
-  if (!raw) return "";
-  return raw.replace(/^https?:\/\/blog\.naver\.com\//i, "").replace(/\/.*$/g, "").trim();
-}
-
-function loadCredentials(requestCredentials?: PublishRequest["credentials"]): Credentials {
-  const requestUsername = normalizeCredentialText(
-    requestCredentials?.username ?? requestCredentials?.naverUsername,
-  );
-  const requestPassword =
-    typeof requestCredentials?.password === "string"
-      ? requestCredentials.password
-      : typeof requestCredentials?.naverPassword === "string"
-        ? requestCredentials.naverPassword
-        : "";
-  const requestBlogId = normalizeCredentialBlogId(
-    requestCredentials?.blogId ?? requestCredentials?.naverBlogId,
-  );
-
-  if (requestUsername || requestPassword || requestBlogId) {
-    if (!requestUsername || !requestPassword || !requestBlogId) {
-      throw new Error(
-        "요청 계정 정보가 불완전합니다. 네이버 아이디/비밀번호/블로그 아이디를 모두 확인해주세요.",
-      );
-    }
-    return { username: requestUsername, password: requestPassword, blogId: requestBlogId };
-  }
-
-  const username = (process.env.NAVER_USERNAME || "").trim();
-  const password = (process.env.NAVER_PASSWORD || "").trim();
-  const blogId = (process.env.NAVER_BLOG_ID || "").trim();
+function loadCredentials(requestCredentials: PublishRequest["credentials"]): Credentials {
+  const username = typeof requestCredentials?.username === "string" ? requestCredentials.username.trim() : "";
+  const password = typeof requestCredentials?.password === "string" ? requestCredentials.password : "";
+  const blogIdRaw = typeof requestCredentials?.blogId === "string" ? requestCredentials.blogId.trim() : "";
+  const blogId = blogIdRaw.replace(/^https?:\/\/blog\.naver\.com\//i, "").replace(/\/.*$/g, "").trim();
 
   if (!username || !password || !blogId) {
-    throw new Error("네이버 계정 정보가 없습니다. .env.local 또는 NAVER_* 환경변수를 확인해주세요.");
+    throw new Error(
+      "요청 계정 정보가 불완전합니다. 네이버 아이디/비밀번호/블로그 아이디를 모두 확인해주세요.",
+    );
   }
 
   return { username, password, blogId };
