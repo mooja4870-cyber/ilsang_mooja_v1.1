@@ -36,6 +36,17 @@ interface ServerGeminiError extends Error {
   responseId?: string;
 }
 
+interface PublishCredentials {
+  username: string;
+  password: string;
+  blogId: string;
+}
+
+interface ParsedPublishCredentials {
+  provided: boolean;
+  credentials: PublishCredentials | null;
+}
+
 const GEMINI_KEY_COOLDOWN_DEFAULT_SECONDS = 30;
 const GEMINI_KEY_COOLDOWN_INVALID_SECONDS = 600;
 const GEMINI_KEY_COOLDOWN_MAX_SECONDS = 600;
@@ -73,11 +84,54 @@ function toSafeString(value: unknown) {
   return typeof value === "string" ? value.trim() : "";
 }
 
+function toRawString(value: unknown) {
+  return typeof value === "string" ? value : "";
+}
+
 function toSafeStringArray(value: unknown) {
   if (!Array.isArray(value)) return [];
   return value
     .map((item) => toSafeString(item))
     .filter(Boolean);
+}
+
+function normalizeBlogId(value: unknown) {
+  const raw = toSafeString(value);
+  if (!raw) return "";
+  return raw.replace(/^https?:\/\/blog\.naver\.com\//i, "").replace(/\/.*$/g, "").trim();
+}
+
+function parseRequestCredentials(payload: any): ParsedPublishCredentials {
+  const body = payload && typeof payload === "object" ? payload : {};
+  const nested = body.credentials && typeof body.credentials === "object" ? body.credentials : {};
+
+  const username = toSafeString(
+    nested.username ?? nested.naverUsername ?? body.naverUsername ?? body.username,
+  );
+  const password = toRawString(
+    nested.password ?? nested.naverPassword ?? body.naverPassword ?? body.password,
+  );
+  const blogId = normalizeBlogId(
+    nested.blogId ?? nested.naverBlogId ?? body.naverBlogId ?? body.blogId,
+  );
+
+  const provided = Boolean(username || password || blogId);
+  if (!provided) {
+    return { provided: false, credentials: null };
+  }
+
+  if (!username || !password || !blogId) {
+    return { provided: true, credentials: null };
+  }
+
+  return {
+    provided: true,
+    credentials: {
+      username,
+      password,
+      blogId,
+    },
+  };
 }
 
 function getGeminiKeyCooldownMs(apiKey: string) {
@@ -273,14 +327,20 @@ function updatePublishJob(jobId: string, patch: Partial<PublishAsyncJob>) {
   });
 }
 
-async function runPublishJob(jobId: string, title: string, content: string, images: string[]) {
+async function runPublishJob(
+  jobId: string,
+  title: string,
+  content: string,
+  images: string[],
+  credentials: PublishCredentials,
+) {
   updatePublishJob(jobId, {
     status: "running",
     message: "네이버에 발행 처리 중입니다.",
   });
 
   try {
-    const result = await publishToNaver({ title, content, images });
+    const result = await publishToNaver({ title, content, images, credentials });
     if (!result.ok) {
       updatePublishJob(jobId, {
         status: "failed",
@@ -427,6 +487,7 @@ async function startServer() {
     try {
       const { title, content, images, quote, quoteText, quoteAuthor, sections, hashtags } = req.body || {};
       const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
+      const parsedCredentials = parseRequestCredentials(req.body);
 
       if (!title || !normalizedContent) {
         return res.status(400).json({
@@ -437,12 +498,25 @@ async function startServer() {
         });
       }
 
+      if (!parsedCredentials.credentials) {
+        return res.status(400).json({
+          success: false,
+          reason: "INVALID_CREDENTIALS",
+          message:
+            parsedCredentials.provided
+              ? "요청 계정 정보가 불완전합니다. 네이버 아이디/비밀번호/블로그 아이디를 모두 입력해주세요."
+              : "요청 계정 정보가 없습니다. 네이버 아이디/비밀번호/블로그 아이디를 입력해주세요.",
+          url: "",
+        });
+      }
+
       console.log(`\x1b[36m[POSTING]\x1b[0m Publishing to Naver... (Images: ${images?.length || 0})`);
       
       const result = await publishToNaver({
         title,
         content: normalizedContent,
         images,
+        credentials: parsedCredentials.credentials,
         quote,
         quoteText,
         quoteAuthor,
@@ -452,12 +526,17 @@ async function startServer() {
 
       console.log(`\x1b[32m[SUCCESS]\x1b[0m Blog published: ${result.postUrl || 'Success'}`);
 
+      const requestEditorUrl = `https://blog.naver.com/${encodeURIComponent(
+        parsedCredentials.credentials.blogId,
+      )}/postwrite`;
+
       return res.json({
         success: true,
         reason: result.reason,
         message: result.message,
         url: result.postUrl,
-        editorUrl: naverEditorUrl,
+        editorUrl: requestEditorUrl || naverEditorUrl,
+        targetBlogId: parsedCredentials.credentials.blogId,
         contentLength: result.contentLength,
       });
     } catch (error: any) {
@@ -474,12 +553,25 @@ async function startServer() {
   app.post("/api/publish-async", async (req, res) => {
     const { title, content, images } = req.body || {};
     const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
+    const parsedCredentials = parseRequestCredentials(req.body);
 
     if (!title || !normalizedContent) {
       return res.status(400).json({
         success: false,
         reason: "POST_FAIL",
         message: "title과 content는 필수입니다.",
+        url: "",
+      });
+    }
+
+    if (!parsedCredentials.credentials) {
+      return res.status(400).json({
+        success: false,
+        reason: "INVALID_CREDENTIALS",
+        message:
+          parsedCredentials.provided
+            ? "요청 계정 정보가 불완전합니다. 네이버 아이디/비밀번호/블로그 아이디를 모두 입력해주세요."
+            : "요청 계정 정보가 없습니다. 네이버 아이디/비밀번호/블로그 아이디를 입력해주세요.",
         url: "",
       });
     }
@@ -495,7 +587,7 @@ async function startServer() {
       acceptedAt: job.createdAt,
     });
 
-    void runPublishJob(job.id, title, normalizedContent, imageList);
+    void runPublishJob(job.id, title, normalizedContent, imageList, parsedCredentials.credentials);
   });
 
   app.get("/api/publish-status/:jobId", (req, res) => {
