@@ -1471,14 +1471,24 @@ async function insertSingleParagraphGap(page: Page) {
   await page.waitForTimeout(50);
 }
 
+const DESCRIPTIVE_SUBTITLE_FALLBACKS = [
+  "오늘의 한 장면", "소소한 일상의 기록", "마음이 머무는 순간",
+  "따뜻한 하루의 조각", "기억하고 싶은 풍경", "잔잔한 오후의 여유",
+  "걸음마다 담긴 이야기", "빛나는 순간들", "일상 속 작은 행복", "오늘도 감사한 하루"
+];
+
 function sanitizeSubtitleText(text: string, sectionIndex: number) {
-  const normalized = sanitizeContent(text)
+  let normalized = sanitizeContent(text)
     .replace(/^#+\s*/, "")
     .replace(/^■\s*/, "")
     .replace(/\s*■$/, "")
     .replace(/^소제목[:：]?\s*/i, "")
     .trim();
-  return normalized || `소제목 ${sectionIndex + 1}`;
+  // "소제목 1", "섹션 2" 같은 generic 번호 소제목 제거
+  if (/^(?:소제목|섹션|section|subtitle)\s*\d*$/i.test(normalized) || /^\d+$/.test(normalized)) {
+    normalized = "";
+  }
+  return normalized || DESCRIPTIVE_SUBTITLE_FALLBACKS[sectionIndex % DESCRIPTIVE_SUBTITLE_FALLBACKS.length];
 }
 
 function normalizeBodyTextForSection(text: string) {
@@ -1546,7 +1556,7 @@ function normalizeSectionsForImageCount(request: PublishRequest, imageCount: num
   const filled = [...normalized];
   while (filled.length < imageCount) {
     const idx = filled.length;
-    const subtitle = `소제목 ${idx + 1}`;
+    const subtitle = DESCRIPTIVE_SUBTITLE_FALLBACKS[idx % DESCRIPTIVE_SUBTITLE_FALLBACKS.length];
     filled.push({
       subtitle,
       body: normalizeBodyTextForSection("사진의 분위기와 장면을 중심으로 오늘의 감정을 기록합니다."),
