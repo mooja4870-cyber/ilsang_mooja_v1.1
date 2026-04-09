@@ -5,6 +5,7 @@ import cors from "cors";
 import { createServer as createViteServer } from "vite";
 import { publishToNaver, closeGlobalBrowser } from "./naverPublisher";
 import { generateBlogPost } from "./src/services/geminiService";
+import { buildVectorIndex, chatWithRag } from "./src/services/chatRagService";
 import type { UserInput } from "./src/types";
 
 dotenv.config({ path: ".env.local" });
@@ -620,6 +621,44 @@ async function startServer() {
     });
   });
 
+  /* ── RAG Chat Endpoint ── */
+  app.post("/api/chat", async (req, res) => {
+    const query = typeof req.body?.query === "string" ? req.body.query.trim() : "";
+    if (!query) {
+      return res.status(400).json({
+        success: false,
+        message: "질문을 입력해 주세요.",
+      });
+    }
+
+    const keys = parseGeminiApiKeysFromEnv();
+    const clientKey = typeof req.body?.geminiApiKey === "string" ? req.body.geminiApiKey.trim() : "";
+    const apiKey = keys[0] || clientKey;
+
+    if (!apiKey) {
+      return res.status(503).json({
+        success: false,
+        code: "API_KEY_MISSING",
+        message: "Gemini API 키가 설정되지 않았습니다.",
+      });
+    }
+
+    try {
+      const answer = await chatWithRag(query, apiKey);
+      res.set("Cache-Control", "no-store");
+      return res.json({
+        success: true,
+        answer,
+      });
+    } catch (error: any) {
+      console.error("[RAG Chat] Error:", error.message);
+      return res.status(500).json({
+        success: false,
+        message: "답변 생성 중 오류가 발생했습니다.",
+      });
+    }
+  });
+
   app.post("/api/publish-sample", async (req, res) => {
     const sampleTitle = "[테스트] 네이버 자동 발행 샘플";
     const sampleContent =
@@ -693,6 +732,14 @@ async function startServer() {
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  // Pre-build RAG vector index on startup
+  const startupKeys = parseGeminiApiKeysFromEnv();
+  if (startupKeys.length > 0) {
+    buildVectorIndex(startupKeys[0]).catch((err) => {
+      console.warn("[RAG] Vector index build failed on startup:", err.message);
     });
   }
 
