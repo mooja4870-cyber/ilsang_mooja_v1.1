@@ -279,7 +279,12 @@ interface PublishAsyncJob {
 }
 
 const publishJobs = new Map<string, PublishAsyncJob>();
+const activePublishJobByUser = new Map<string, string>();
 const MAX_PUBLISH_JOBS = 80;
+
+function getPublishJobUserKey(credentials: PublishCredentials) {
+  return `${credentials.username.trim().toLowerCase()}::${credentials.blogId.trim().toLowerCase()}`;
+}
 
 function createPublishJobId() {
   return `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
@@ -335,6 +340,7 @@ async function runPublishJob(
   images: string[],
   credentials: PublishCredentials,
 ) {
+  const userKey = getPublishJobUserKey(credentials);
   updatePublishJob(jobId, {
     status: "running",
     message: "네이버에 발행 처리 중입니다.",
@@ -375,6 +381,10 @@ async function runPublishJob(
       screenshotPath: "",
       tracePath: "",
     });
+  } finally {
+    if (activePublishJobByUser.get(userKey) === jobId) {
+      activePublishJobByUser.delete(userKey);
+    }
   }
 }
 
@@ -386,15 +396,12 @@ async function startServer() {
   app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Cache-Control', 'Pragma']
   }));
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-  const naverBlogId = (process.env.NAVER_BLOG_ID || "").trim();
-  const naverEditorUrl = naverBlogId
-    ? `https://blog.naver.com/${encodeURIComponent(naverBlogId)}/postwrite`
-    : "https://blog.naver.com";
+  const defaultNaverEditorUrl = "https://blog.naver.com";
 
   app.get("/api/health", (req, res) => {
     res.set("Cache-Control", "no-store");
@@ -525,6 +532,21 @@ async function startServer() {
         hashtags,
       });
 
+      if (!result.ok) {
+        const statusCode =
+          result.message.includes("같은 계정의 이전 발행 작업") ? 409 : 500;
+        return res.status(statusCode).json({
+          success: false,
+          reason: result.reason,
+          message: result.message,
+          url: result.postUrl || "",
+          targetBlogId: parsedCredentials.credentials.blogId,
+          contentLength: result.contentLength || 0,
+          screenshotPath: result.screenshotPath || "",
+          tracePath: result.tracePath || "",
+        });
+      }
+
       console.log(`\x1b[32m[SUCCESS]\x1b[0m Blog published: ${result.postUrl || 'Success'}`);
 
       const requestEditorUrl = `https://blog.naver.com/${encodeURIComponent(
@@ -536,7 +558,7 @@ async function startServer() {
         reason: result.reason,
         message: result.message,
         url: result.postUrl,
-        editorUrl: requestEditorUrl || naverEditorUrl,
+        editorUrl: requestEditorUrl || defaultNaverEditorUrl,
         targetBlogId: parsedCredentials.credentials.blogId,
         contentLength: result.contentLength,
       });
@@ -578,7 +600,22 @@ async function startServer() {
     }
 
     const imageList = Array.isArray(images) ? images : [];
+    const userKey = getPublishJobUserKey(parsedCredentials.credentials);
+    const activeJobId = activePublishJobByUser.get(userKey);
+    const activeJob = activeJobId ? publishJobs.get(activeJobId) : null;
+
+    if (activeJob && (activeJob.status === "queued" || activeJob.status === "running")) {
+      return res.status(409).json({
+        success: false,
+        reason: "PUBLISH_IN_PROGRESS",
+        message: "같은 계정의 이전 발행 작업이 아직 진행 중입니다. 완료 후 다시 시도해주세요.",
+        jobId: activeJob.id,
+        status: activeJob.status,
+      });
+    }
+
     const job = createPublishJob();
+    activePublishJobByUser.set(userKey, job.id);
 
     res.status(202).json({
       success: true,

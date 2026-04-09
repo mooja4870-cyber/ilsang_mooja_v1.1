@@ -67,9 +67,15 @@ interface ParagraphImagePlan {
 const RUNTIME_DIR = path.join(process.cwd(), ".runtime");
 const SESSION_FILE_LEGACY = path.join(RUNTIME_DIR, "browser_session.json");
 
-function sessionFileForUser(username: string): string {
+function toSafeCredentialToken(value: string) {
+  return value.replace(/[^a-zA-Z0-9_\-]/g, "_");
+}
+
+function sessionFileForUser(username: string, blogId?: string): string {
   const safe = username.replace(/[^a-zA-Z0-9_\-]/g, "_");
-  return path.join(RUNTIME_DIR, `browser_session_${safe}.json`);
+  const safeBlog = blogId ? toSafeCredentialToken(blogId) : "";
+  const suffix = safeBlog ? `_${safeBlog}` : "";
+  return path.join(RUNTIME_DIR, `browser_session_${safe}${suffix}.json`);
 }
 const SCREENSHOT_DIR = path.join(RUNTIME_DIR, "screenshots");
 const UPLOAD_DIR = path.join(RUNTIME_DIR, "uploads");
@@ -206,12 +212,12 @@ const CONFIRM_BUTTON_TEXTS = ["공개 발행", "다음", "확인", "등록", "�
 const IMAGE_MARKER_REGEX = /\[IMAGE_(\d+)\]/g;
 const IMAGE_MARKER_TOKEN_REGEX = /\[IMAGE_\d+\]/g;
 
-let isPublishInFlight = false;
+const publishInFlightByUser = new Map<string, number>();
 
 // Browser reuse optimization
 let globalBrowser: Browser | null = null;
 let globalBrowserLastError: Error | null = null;
-const BROWSER_REUSE_ENABLED = (process.env.NAVER_BROWSER_REUSE !== "false");
+const BROWSER_REUSE_ENABLED = process.env.NAVER_BROWSER_REUSE === "true";
 
 function nowToken() {
   const d = new Date();
@@ -296,6 +302,16 @@ function isRetryableReason(reason: ReasonCode) {
     "NAVER_SESSION_INVALID",
     "NAVER_SESSION_PROBE_TIMEOUT",
     "NAVER_SESSION_MISSING",
+  ].includes(reason);
+}
+
+function isRetryableSessionFailure(reason: ReasonCode) {
+  return [
+    "NAVER_SESSION_INVALID",
+    "NAVER_SESSION_PROBE_TIMEOUT",
+    "NAVER_SESSION_MISSING",
+    "NAVER_LOGIN_REQUIRED",
+    "NAVER_WRONG_BLOG_TARGET",
   ].includes(reason);
 }
 
@@ -385,22 +401,26 @@ function cleanupTempFiles(files: string[]) {
   }
 }
 
-function isSessionStateAvailable(username?: string) {
+function getPublishLockKey(credentials: Credentials) {
+  return `${toSafeCredentialToken(credentials.username)}::${toSafeCredentialToken(credentials.blogId)}`;
+}
+
+function isSessionStateAvailable(username?: string, blogId?: string) {
   if (username) {
-    return fs.existsSync(sessionFileForUser(username));
+    return fs.existsSync(sessionFileForUser(username, blogId));
   }
   return fs.existsSync(SESSION_FILE_LEGACY);
 }
 
-function getSessionFile(username?: string): string {
+function getSessionFile(username?: string, blogId?: string): string {
   if (username) {
-    return sessionFileForUser(username);
+    return sessionFileForUser(username, blogId);
   }
   return SESSION_FILE_LEGACY;
 }
 
-function deleteSessionFile(username?: string) {
-  const file = getSessionFile(username);
+function deleteSessionFile(username?: string, blogId?: string) {
+  const file = getSessionFile(username, blogId);
   try {
     if (fs.existsSync(file)) fs.unlinkSync(file);
   } catch { /* ignore */ }
@@ -491,14 +511,18 @@ export function closeGlobalBrowser() {
   }
 }
 
-async function createContext(browser: Browser, username?: string): Promise<BrowserContext> {
-  const sessionFile = getSessionFile(username);
-  if (username && isSessionStateAvailable(username)) {
-    console.log(`[naverPublisher] Loading session for user: ${username}`);
+async function createContext(browser: Browser, credentials?: Credentials): Promise<BrowserContext> {
+  const username = credentials?.username;
+  const blogId = credentials?.blogId;
+  const sessionFile = getSessionFile(username, blogId);
+  if (username && isSessionStateAvailable(username, blogId)) {
+    console.log(`[naverPublisher] Loading session for user: ${username} (${blogId || "unknown-blog"})`);
     return browser.newContext({ storageState: sessionFile, viewport: { width: 1440, height: 900 } });
   }
   // 레거시 세션 파일이 있어도 계정이 다를 수 있으므로 사용하지 않음
-  console.log(`[naverPublisher] Creating fresh context (no session for ${username || "unknown"})`);
+  console.log(
+    `[naverPublisher] Creating fresh context (no session for ${username || "unknown"} / ${blogId || "unknown-blog"})`,
+  );
   return browser.newContext({ viewport: { width: 1440, height: 900 } });
 }
 
@@ -3224,7 +3248,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
 
   try {
     browser = await getOrLaunchBrowser(headless);
-    context = await createContext(browser, credentials.username);
+    context = await createContext(browser, credentials);
     if (traceEnabled) {
       await context.tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => {});
       traceStarted = true;
@@ -3237,7 +3261,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
       // 세션 문제로 실패 → 해당 계정 세션 삭제 후 재시도 가능하도록
       if (isRetryableSessionFailure(probe.reason)) {
         console.log(`[naverPublisher] Session failure for ${credentials.username}, deleting session file`);
-        deleteSessionFile(credentials.username);
+        deleteSessionFile(credentials.username, credentials.blogId);
       }
       return finish({
         ok: false,
@@ -3250,7 +3274,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
     }
 
     // 성공 시 해당 계정의 세션 저장
-    await context.storageState({ path: getSessionFile(credentials.username) });
+    await context.storageState({ path: getSessionFile(credentials.username, credentials.blogId) });
 
     const titleOk = await fillTitle(page, request.title.trim());
     if (!titleOk) {
@@ -3423,7 +3447,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
     }
 
     const contentLength = await publishedContentLength(page);
-    await context.storageState({ path: getSessionFile(credentials.username) });
+    await context.storageState({ path: getSessionFile(credentials.username, credentials.blogId) });
 
     succeeded = true;
     return finish({
@@ -3459,8 +3483,9 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
       }
     }
     await context?.close().catch(() => {});
-    // Don't close global browser - it's reused for performance optimization
-    // Only close context for isolation
+    if (!BROWSER_REUSE_ENABLED && browser) {
+      await browser.close().catch(() => {});
+    }
   }
 }
 
@@ -3477,17 +3502,20 @@ export async function publishToNaver(request: PublishRequest): Promise<PublishPi
     };
   }
 
-  if (isPublishInFlight) {
+  const credentials = loadCredentials(request.credentials);
+  const publishLockKey = getPublishLockKey(credentials);
+
+  if (publishInFlightByUser.has(publishLockKey)) {
     return {
       ok: false,
       reason: "POST_FAIL",
       postUrl: "",
       contentLength: 0,
-      message: "이전 발행 작업이 아직 진행 중입니다. 10초 후 다시 눌러주세요.",
+      message: "같은 계정의 이전 발행 작업이 아직 진행 중입니다. 잠시 후 다시 눌러주세요.",
     };
   }
 
-  isPublishInFlight = true;
+  publishInFlightByUser.set(publishLockKey, Date.now());
   try {
     const maxAttempts = getMaxPublishAttempts();
     let lastResult: PublishPipelineResult | null = null;
@@ -3525,6 +3553,6 @@ export async function publishToNaver(request: PublishRequest): Promise<PublishPi
 
     return lastResult;
   } finally {
-    isPublishInFlight = false;
+    publishInFlightByUser.delete(publishLockKey);
   }
 }
