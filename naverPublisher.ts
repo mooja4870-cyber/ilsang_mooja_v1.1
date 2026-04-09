@@ -2053,10 +2053,30 @@ async function enforceBoldOnLatestTextBlock(page: Page) {
   return false;
 }
 
-async function insertFormattedSubtitle(page: Page, subtitle: string) {
+function ensureMeaningfulSubtitle(subtitle: string, body: string, sectionIndex: number): string {
+  const cleaned = subtitle.replace(/^■\s*/, "").replace(/\s*■$/, "").trim();
+  // "소제목 N", "섹션 N", 숫자만, 빈문자열 등 generic 패턴 감지
+  if (!cleaned
+    || /^(?:소제목|섹션|section|subtitle)\s*\d*$/i.test(cleaned)
+    || /^\d+$/.test(cleaned)
+    || /^오늘의\s*장면\s*\d+$/.test(cleaned)) {
+    // body에서 첫 문장의 핵심 키워드를 추출하여 소제목 생성
+    const bodyClean = (body || "").replace(/\s+/g, " ").trim();
+    const firstSentence = bodyClean.split(/[.!?。！？]/)[0]?.trim() || "";
+    if (firstSentence.length >= 6) {
+      // 첫 문장에서 의미 있는 부분 추출 (최대 20자)
+      return firstSentence.length <= 20 ? firstSentence : firstSentence.slice(0, 18) + "…";
+    }
+    return DESCRIPTIVE_SUBTITLE_FALLBACKS[sectionIndex % DESCRIPTIVE_SUBTITLE_FALLBACKS.length];
+  }
+  return cleaned;
+}
+
+async function insertFormattedSubtitle(page: Page, subtitle: string, body?: string, sectionIndex?: number) {
+  const finalSubtitle = ensureMeaningfulSubtitle(subtitle, body || "", sectionIndex ?? 0);
   await moveCaretToEditorEnd(page);
   await toggleBoldTypingMode(page);
-  await page.keyboard.insertText(`■ ${subtitle} ■`);
+  await page.keyboard.insertText(`■ ${finalSubtitle} ■`);
   await page.waitForTimeout(50);
   await toggleBoldTypingMode(page);
   await applyStyleToLatestTextBlock(page, {
@@ -2151,7 +2171,7 @@ async function fillContentAndInsertImagesBySectionStructure(page: Page, request:
       insertedImages += 1;
 
       await insertSingleParagraphGap(page);
-      await insertFormattedSubtitle(page, section.subtitle);
+      await insertFormattedSubtitle(page, section.subtitle, section.body, i);
       expectedParts.push(section.subtitle);
 
       await page.keyboard.press("Enter").catch(() => {});
