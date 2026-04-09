@@ -65,7 +65,12 @@ interface ParagraphImagePlan {
 }
 
 const RUNTIME_DIR = path.join(process.cwd(), ".runtime");
-const SESSION_FILE = path.join(RUNTIME_DIR, "browser_session.json");
+const SESSION_FILE_LEGACY = path.join(RUNTIME_DIR, "browser_session.json");
+
+function sessionFileForUser(username: string): string {
+  const safe = username.replace(/[^a-zA-Z0-9_\-]/g, "_");
+  return path.join(RUNTIME_DIR, `browser_session_${safe}.json`);
+}
 const SCREENSHOT_DIR = path.join(RUNTIME_DIR, "screenshots");
 const UPLOAD_DIR = path.join(RUNTIME_DIR, "uploads");
 const TRACE_DIR = path.join(RUNTIME_DIR, "traces");
@@ -380,8 +385,25 @@ function cleanupTempFiles(files: string[]) {
   }
 }
 
-function isSessionStateAvailable() {
-  return fs.existsSync(SESSION_FILE);
+function isSessionStateAvailable(username?: string) {
+  if (username) {
+    return fs.existsSync(sessionFileForUser(username));
+  }
+  return fs.existsSync(SESSION_FILE_LEGACY);
+}
+
+function getSessionFile(username?: string): string {
+  if (username) {
+    return sessionFileForUser(username);
+  }
+  return SESSION_FILE_LEGACY;
+}
+
+function deleteSessionFile(username?: string) {
+  const file = getSessionFile(username);
+  try {
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+  } catch { /* ignore */ }
 }
 
 function getBrowserExecutablePath() {
@@ -469,10 +491,14 @@ export function closeGlobalBrowser() {
   }
 }
 
-async function createContext(browser: Browser): Promise<BrowserContext> {
-  if (isSessionStateAvailable()) {
-    return browser.newContext({ storageState: SESSION_FILE, viewport: { width: 1440, height: 900 } });
+async function createContext(browser: Browser, username?: string): Promise<BrowserContext> {
+  const sessionFile = getSessionFile(username);
+  if (username && isSessionStateAvailable(username)) {
+    console.log(`[naverPublisher] Loading session for user: ${username}`);
+    return browser.newContext({ storageState: sessionFile, viewport: { width: 1440, height: 900 } });
   }
+  // 레거시 세션 파일이 있어도 계정이 다를 수 있으므로 사용하지 않음
+  console.log(`[naverPublisher] Creating fresh context (no session for ${username || "unknown"})`);
   return browser.newContext({ viewport: { width: 1440, height: 900 } });
 }
 
@@ -846,7 +872,9 @@ async function ensureComposeReady(
     const onLoginPage = await looksLikeLoginPage(page);
     if (onLoginPage) {
       lastReason = sawCaptcha ? "NAVER_CAPTCHA_REQUIRED" : "NAVER_LOGIN_REQUIRED";
-      if ((loginMode === "auto" || loginMode === "hybrid") && !autoLoginDone) {
+      // 항상 자동 로그인 시도 (계정별 세션이므로 로그인 페이지 = 세션 없음)
+      if (!autoLoginDone) {
+        console.log(`[naverPublisher] Auto-login attempt for: ${credentials.username}`);
         autoLoginDone = await attemptAutoLogin(page, credentials);
       }
       await page.waitForTimeout(1200);
@@ -3170,7 +3198,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
 
   try {
     browser = await getOrLaunchBrowser(headless);
-    context = await createContext(browser);
+    context = await createContext(browser, credentials.username);
     if (traceEnabled) {
       await context.tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => {});
       traceStarted = true;
@@ -3180,6 +3208,11 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
 
     const probe = await ensureComposeReady(page, credentials);
     if (!probe.ok) {
+      // 세션 문제로 실패 → 해당 계정 세션 삭제 후 재시도 가능하도록
+      if (isRetryableSessionFailure(probe.reason)) {
+        console.log(`[naverPublisher] Session failure for ${credentials.username}, deleting session file`);
+        deleteSessionFile(credentials.username);
+      }
       return finish({
         ok: false,
         reason: probe.reason,
@@ -3190,7 +3223,8 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
       });
     }
 
-    await context.storageState({ path: SESSION_FILE });
+    // 성공 시 해당 계정의 세션 저장
+    await context.storageState({ path: getSessionFile(credentials.username) });
 
     const titleOk = await fillTitle(page, request.title.trim());
     if (!titleOk) {
@@ -3363,7 +3397,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
     }
 
     const contentLength = await publishedContentLength(page);
-    await context.storageState({ path: SESSION_FILE });
+    await context.storageState({ path: getSessionFile(credentials.username) });
 
     succeeded = true;
     return finish({
