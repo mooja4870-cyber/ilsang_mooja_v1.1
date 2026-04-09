@@ -791,40 +791,64 @@ async function attemptAutoLogin(page: Page, credentials: Credentials) {
   const pwField = page.locator("input#pw").first();
   const submitButton = page.locator("button[type='submit'], button:has-text('로그인')").first();
 
-  if (!(await maybeVisible(idField, 1000)) || !(await maybeVisible(pwField, 1000))) {
+  if (!(await maybeVisible(idField, 2000)) || !(await maybeVisible(pwField, 2000))) {
     return false;
   }
 
-  const safeFill = async (locator: Locator, value: string) => {
+  // 사람처럼 키보드로 한 글자씩 입력 (fill/evaluate는 네이버 봇감지에 걸림)
+  const humanType = async (locator: Locator, value: string) => {
     try {
-      await locator.fill(value, { timeout: 2500 });
-      return true;
-    } catch {
-      try {
-        await locator.evaluate((el, v) => {
-          const input = el as HTMLInputElement;
-          input.value = v;
-          input.dispatchEvent(new Event("input", { bubbles: true }));
-          input.dispatchEvent(new Event("change", { bubbles: true }));
-        }, value);
-        return true;
-      } catch {
-        return false;
+      await locator.click({ timeout: 3000 });
+      await page.waitForTimeout(200 + Math.random() * 300);
+      // 기존 값 클리어
+      await page.keyboard.press("Meta+A").catch(() => {});
+      await page.keyboard.press("Control+A").catch(() => {});
+      await page.keyboard.press("Backspace");
+      await page.waitForTimeout(100 + Math.random() * 200);
+      // 한 글자씩 타이핑 (랜덤 딜레이)
+      for (const ch of value) {
+        await page.keyboard.type(ch, { delay: 30 + Math.random() * 80 });
       }
+      return true;
+    } catch (e) {
+      console.log(`[naverPublisher] humanType failed: ${e}`);
+      return false;
     }
   };
 
-  const idOk = await safeFill(idField, credentials.username);
-  const pwOk = await safeFill(pwField, credentials.password);
+  const idOk = await humanType(idField, credentials.username);
+  await page.waitForTimeout(300 + Math.random() * 500);
+  const pwOk = await humanType(pwField, credentials.password);
   if (!idOk || !pwOk) return false;
 
-  if (await maybeVisible(submitButton, 500)) {
-    await submitButton.click({ timeout: 2500 }).catch(() => {});
+  await page.waitForTimeout(500 + Math.random() * 500);
+
+  if (await maybeVisible(submitButton, 1000)) {
+    await submitButton.click({ timeout: 3000 }).catch(() => {});
   } else {
     await page.keyboard.press("Enter");
   }
 
-  await page.waitForTimeout(1200);
+  // 로그인 후 충분히 대기 (리다이렉트/보안확인 페이지 등)
+  await page.waitForTimeout(3000);
+
+  // 보안 확인 / 새 기기 등록 안내 등 스킵
+  const skipSelectors = [
+    "button:has-text('나중에 하기')",
+    "button:has-text('다음에')",
+    "button:has-text('skip')",
+    "a:has-text('나중에 등록')",
+    "button:has-text('확인')",
+  ];
+  for (const sel of skipSelectors) {
+    const btn = page.locator(sel).first();
+    if (await maybeVisible(btn, 500)) {
+      await btn.click({ timeout: 2000 }).catch(() => {});
+      await page.waitForTimeout(1000);
+      break;
+    }
+  }
+
   return true;
 }
 
@@ -856,7 +880,8 @@ async function ensureComposeReady(
     return { ok: true, reason: "OK" };
   }
 
-  let autoLoginDone = false;
+  let autoLoginAttempts = 0;
+  const maxAutoLoginAttempts = 3;
   const loginMode = getLoginMode();
   const timeoutSec = Number(process.env.NAVER_SESSION_REFRESH_TIMEOUT_SEC || "300");
   const timeoutAt = Date.now() + timeoutSec * 1000;
@@ -872,12 +897,13 @@ async function ensureComposeReady(
     const onLoginPage = await looksLikeLoginPage(page);
     if (onLoginPage) {
       lastReason = sawCaptcha ? "NAVER_CAPTCHA_REQUIRED" : "NAVER_LOGIN_REQUIRED";
-      // 항상 자동 로그인 시도 (계정별 세션이므로 로그인 페이지 = 세션 없음)
-      if (!autoLoginDone) {
-        console.log(`[naverPublisher] Auto-login attempt for: ${credentials.username}`);
-        autoLoginDone = await attemptAutoLogin(page, credentials);
+      // 자동 로그인 최대 3회 시도 (봇감지/보안확인 등으로 1회 실패 가능)
+      if (autoLoginAttempts < maxAutoLoginAttempts) {
+        autoLoginAttempts++;
+        console.log(`[naverPublisher] Auto-login attempt ${autoLoginAttempts}/${maxAutoLoginAttempts} for: ${credentials.username}`);
+        await attemptAutoLogin(page, credentials);
       }
-      await page.waitForTimeout(1200);
+      await page.waitForTimeout(1500);
       continue;
     }
 
