@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { spawnSync } from "child_process";
-import { chromium, type Browser, type BrowserContext, type Frame, type Locator, type Page } from "playwright-core";
+import { chromium, type Browser, type BrowserContext, type Frame, type Locator, type Page } from "playwright";
 
 type ReasonCode =
   | "OK"
@@ -23,11 +23,21 @@ interface Credentials {
   blogId: string;
 }
 
+interface PublishSessionControl {
+  credentialOwner?: string;
+  sessionKey?: string;
+  forceFreshLogin?: boolean;
+  resetSession?: boolean;
+  clearCookies?: boolean;
+  clearStorage?: boolean;
+}
+
 interface PublishRequest {
   title: string;
   content: string;
   images?: string[];
   credentials: Credentials;
+  sessionControl?: PublishSessionControl;
   quote?: string;
   quoteText?: string;
   quoteAuthor?: string;
@@ -64,6 +74,18 @@ interface ParagraphImagePlan {
   canPlaceImagesBetweenParagraphs: boolean;
 }
 
+interface SessionOwnerMetadata {
+  username: string;
+  blogId: string;
+  savedAt: string;
+}
+
+interface ObservedBlogTarget {
+  source: string;
+  blogId: string;
+  url: string;
+}
+
 const RUNTIME_DIR = path.join(process.cwd(), ".runtime");
 const SESSION_FILE_LEGACY = path.join(RUNTIME_DIR, "browser_session.json");
 
@@ -71,11 +93,19 @@ function toSafeCredentialToken(value: string) {
   return value.replace(/[^a-zA-Z0-9_\-]/g, "_");
 }
 
+function normalizeCredentialIdentity(value: string) {
+  return value.trim().toLowerCase();
+}
+
 function sessionFileForUser(username: string, blogId?: string): string {
   const safe = username.replace(/[^a-zA-Z0-9_\-]/g, "_");
   const safeBlog = blogId ? toSafeCredentialToken(blogId) : "";
   const suffix = safeBlog ? `_${safeBlog}` : "";
   return path.join(RUNTIME_DIR, `browser_session_${safe}${suffix}.json`);
+}
+
+function sessionMetaFileForUser(username: string, blogId?: string): string {
+  return sessionFileForUser(username, blogId).replace(/\.json$/i, ".meta.json");
 }
 const SCREENSHOT_DIR = path.join(RUNTIME_DIR, "screenshots");
 const UPLOAD_DIR = path.join(RUNTIME_DIR, "uploads");
@@ -214,10 +244,12 @@ const IMAGE_MARKER_TOKEN_REGEX = /\[IMAGE_\d+\]/g;
 
 const publishInFlightByUser = new Map<string, number>();
 
-// Browser reuse optimization
+// Keep cross-request browser reuse opt-in only and disabled by default for strict account isolation.
 let globalBrowser: Browser | null = null;
 let globalBrowserLastError: Error | null = null;
-const BROWSER_REUSE_ENABLED = process.env.NAVER_BROWSER_REUSE === "true";
+const STRICT_REQUEST_ISOLATION_ENABLED = process.env.NAVER_STRICT_REQUEST_ISOLATION !== "false";
+const BROWSER_REUSE_ENABLED =
+  !STRICT_REQUEST_ISOLATION_ENABLED && process.env.NAVER_BROWSER_REUSE === "true";
 
 function nowToken() {
   const d = new Date();
@@ -302,6 +334,8 @@ function isRetryableReason(reason: ReasonCode) {
     "NAVER_SESSION_INVALID",
     "NAVER_SESSION_PROBE_TIMEOUT",
     "NAVER_SESSION_MISSING",
+    "NAVER_LOGIN_REQUIRED",
+    "NAVER_WRONG_BLOG_TARGET",
   ].includes(reason);
 }
 
@@ -419,11 +453,73 @@ function getSessionFile(username?: string, blogId?: string): string {
   return SESSION_FILE_LEGACY;
 }
 
+function getSessionMetaFile(username?: string, blogId?: string): string {
+  if (username) {
+    return sessionMetaFileForUser(username, blogId);
+  }
+  return SESSION_FILE_LEGACY.replace(/\.json$/i, ".meta.json");
+}
+
+function readSessionOwnerMetadata(username?: string, blogId?: string): SessionOwnerMetadata | null {
+  const metaFile = getSessionMetaFile(username, blogId);
+  try {
+    if (!fs.existsSync(metaFile)) return null;
+    const parsed = JSON.parse(fs.readFileSync(metaFile, "utf8"));
+    if (!parsed || typeof parsed !== "object") return null;
+
+    const metaUsername = typeof parsed.username === "string" ? parsed.username.trim() : "";
+    const metaBlogId = typeof parsed.blogId === "string" ? parsed.blogId.trim() : "";
+    const savedAt = typeof parsed.savedAt === "string" ? parsed.savedAt : "";
+    if (!metaUsername || !metaBlogId) return null;
+
+    return {
+      username: metaUsername,
+      blogId: metaBlogId,
+      savedAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeSessionOwnerMetadata(credentials: Credentials) {
+  const metaFile = getSessionMetaFile(credentials.username, credentials.blogId);
+  const payload: SessionOwnerMetadata = {
+    username: credentials.username,
+    blogId: credentials.blogId,
+    savedAt: new Date().toISOString(),
+  };
+
+  try {
+    fs.writeFileSync(metaFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  } catch (error) {
+    console.warn("[naverPublisher] Failed to write session ownership metadata:", error);
+  }
+}
+
+function hasMatchingSessionOwnerMetadata(credentials: Credentials) {
+  const metadata = readSessionOwnerMetadata(credentials.username, credentials.blogId);
+  if (!metadata) return false;
+
+  return (
+    normalizeCredentialIdentity(metadata.username) === normalizeCredentialIdentity(credentials.username) &&
+    normalizeCredentialIdentity(metadata.blogId) === normalizeCredentialIdentity(credentials.blogId)
+  );
+}
+
 function deleteSessionFile(username?: string, blogId?: string) {
   const file = getSessionFile(username, blogId);
+  const metaFile = getSessionMetaFile(username, blogId);
   try {
     if (fs.existsSync(file)) fs.unlinkSync(file);
-  } catch { /* ignore */ }
+  } catch {
+    // ignore
+  }
+  try {
+    if (fs.existsSync(metaFile)) fs.unlinkSync(metaFile);
+  } catch {
+    // ignore
+  }
 }
 
 function getBrowserExecutablePath() {
@@ -442,29 +538,52 @@ function getBrowserExecutablePath() {
     if (fs.existsSync(candidate)) return candidate;
   }
 
+  try {
+    const bundledPath = chromium.executablePath();
+    if (bundledPath && fs.existsSync(bundledPath)) return bundledPath;
+  } catch {
+    // ignore
+  }
+
   return "";
 }
 
 async function launchBrowser(headless: boolean): Promise<Browser> {
   const executablePath = getBrowserExecutablePath();
-  if (!executablePath) {
-    throw new Error("Chrome 실행 파일을 찾지 못했습니다. BROWSER_EXECUTABLE_PATH를 설정해주세요.");
-  }
   const forceHeadlessForLinuxNoDisplay = process.platform === "linux" && !process.env.DISPLAY;
   const effectiveHeadless = forceHeadlessForLinuxNoDisplay ? true : headless;
   if (forceHeadlessForLinuxNoDisplay && !headless) {
     console.warn("[naverPublisher] DISPLAY가 없어 headless=false 설정을 무시하고 headless=true로 강제합니다.");
   }
 
-  return chromium.launch({
+  const launchOptions = {
     headless: effectiveHeadless,
-    executablePath,
     args: [
       "--disable-dev-shm-usage",
       "--no-sandbox",
       "--disable-blink-features=AutomationControlled",
     ],
-  });
+  };
+
+  if (executablePath) {
+    return chromium.launch({
+      ...launchOptions,
+      executablePath,
+    });
+  }
+
+  console.warn("[naverPublisher] 시스템 Chrome을 찾지 못해 Playwright 기본 Chromium으로 실행을 시도합니다.");
+
+  try {
+    return await chromium.launch(launchOptions);
+  } catch (error: any) {
+    const detail =
+      error && typeof error === "object" && "message" in error ? String(error.message || "") : "";
+    const suffix = detail ? ` (${detail})` : "";
+    throw new Error(
+      `Chrome 실행 파일을 찾지 못했습니다. BROWSER_EXECUTABLE_PATH를 설정하거나 Playwright Chromium을 설치해주세요.${suffix}`,
+    );
+  }
 }
 
 async function isBrowserHealthy(browser: Browser | null): Promise<boolean> {
@@ -478,9 +597,24 @@ async function isBrowserHealthy(browser: Browser | null): Promise<boolean> {
   }
 }
 
+async function disposeReusableBrowser(reason: string) {
+  if (!globalBrowser) return;
+  console.log(`[naverPublisher] Closing reusable browser (${reason})`);
+  try {
+    await globalBrowser.close().catch(() => {});
+  } catch {
+    // ignore
+  }
+  globalBrowser = null;
+  globalBrowserLastError = null;
+}
+
 async function getOrLaunchBrowser(headless: boolean): Promise<Browser> {
   // If reuse disabled, always create new browser
   if (!BROWSER_REUSE_ENABLED) {
+    await disposeReusableBrowser(
+      STRICT_REQUEST_ISOLATION_ENABLED ? "strict request isolation enforced" : "browser reuse disabled",
+    );
     return launchBrowser(headless);
   }
 
@@ -491,12 +625,7 @@ async function getOrLaunchBrowser(headless: boolean): Promise<Browser> {
   }
 
   // Browser is dead or doesn't exist, clean up and launch new one
-  try {
-    await globalBrowser?.close().catch(() => {});
-  } catch {
-    // ignore
-  }
-  globalBrowser = null;
+  await disposeReusableBrowser("browser health check failed");
 
   console.log("[naverPublisher] Launching new browser instance (reuse optimization)");
   globalBrowser = await launchBrowser(headless);
@@ -511,19 +640,48 @@ export function closeGlobalBrowser() {
   }
 }
 
-async function createContext(browser: Browser, credentials?: Credentials): Promise<BrowserContext> {
+function shouldForceFreshContext(sessionControl?: PublishSessionControl) {
+  return Boolean(sessionControl?.forceFreshLogin || sessionControl?.resetSession);
+}
+
+async function createContext(
+  browser: Browser,
+  credentials?: Credentials,
+  sessionControl?: PublishSessionControl,
+): Promise<BrowserContext> {
   const username = credentials?.username;
   const blogId = credentials?.blogId;
   const sessionFile = getSessionFile(username, blogId);
+  const forceFreshContext = shouldForceFreshContext(sessionControl);
+
+  if (username && forceFreshContext) {
+    console.log(
+      `[naverPublisher] Forcing fresh login context for ${username} (${blogId || "unknown-blog"})`,
+    );
+    deleteSessionFile(username, blogId);
+  }
+
   if (username && isSessionStateAvailable(username, blogId)) {
-    console.log(`[naverPublisher] Loading session for user: ${username} (${blogId || "unknown-blog"})`);
-    return browser.newContext({ storageState: sessionFile, viewport: { width: 1440, height: 900 } });
+    if (credentials && !hasMatchingSessionOwnerMetadata(credentials)) {
+      console.warn(
+        `[naverPublisher] Discarding session without matching ownership metadata for ${username} (${blogId || "unknown-blog"})`,
+      );
+      deleteSessionFile(username, blogId);
+    } else {
+      console.log(`[naverPublisher] Loading session for user: ${username} (${blogId || "unknown-blog"})`);
+      return browser.newContext({ storageState: sessionFile, viewport: { width: 1440, height: 900 } });
+    }
   }
   // 레거시 세션 파일이 있어도 계정이 다를 수 있으므로 사용하지 않음
   console.log(
     `[naverPublisher] Creating fresh context (no session for ${username || "unknown"} / ${blogId || "unknown-blog"})`,
   );
   return browser.newContext({ viewport: { width: 1440, height: 900 } });
+}
+
+async function persistSessionState(context: BrowserContext, credentials: Credentials) {
+  await context.storageState({ path: getSessionFile(credentials.username, credentials.blogId) });
+  writeSessionOwnerMetadata(credentials);
 }
 
 async function maybeVisible(locator: Locator, timeout = 350) {
@@ -783,11 +941,62 @@ async function detectCaptcha(page: Page) {
   return false;
 }
 
-function isWrongBlogTarget(currentUrl: string, blogId: string) {
-  if (!currentUrl.includes("blog.naver.com")) return false;
-  const normalizedUrl = currentUrl.toLowerCase();
-  const normalizedBlogId = blogId.toLowerCase();
-  return !normalizedUrl.includes(`blogid=${normalizedBlogId}`) && !normalizedUrl.includes(`blog.naver.com/${normalizedBlogId}`);
+function extractObservedBlogIdFromUrl(rawUrl: string) {
+  if (!rawUrl) return "";
+
+  try {
+    const parsed = new URL(rawUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    if (!hostname.endsWith("naver.com")) return "";
+
+    const queryBlogId = normalizeCredentialIdentity(parsed.searchParams.get("blogId") || "");
+    if (queryBlogId) return queryBlogId;
+
+    if (hostname === "blog.naver.com") {
+      const segments = parsed.pathname.split("/").filter(Boolean);
+      const pathBlogId = normalizeCredentialIdentity(decodeURIComponent(segments[0] || ""));
+      if (pathBlogId && pathBlogId !== "postwriteform.naver") {
+        return pathBlogId;
+      }
+    }
+  } catch {
+    return "";
+  }
+
+  return "";
+}
+
+function collectObservedBlogTargets(page: Page): ObservedBlogTarget[] {
+  const observed = new Map<string, ObservedBlogTarget>();
+  const addTarget = (source: string, url: string) => {
+    const observedBlogId = extractObservedBlogIdFromUrl(url);
+    if (!observedBlogId) return;
+
+    const key = `${source}:${observedBlogId}:${url}`;
+    if (!observed.has(key)) {
+      observed.set(key, {
+        source,
+        blogId: observedBlogId,
+        url,
+      });
+    }
+  };
+
+  addTarget("page", page.url());
+  const frames = page.frames();
+  for (let index = 0; index < frames.length; index += 1) {
+    const frame = frames[index];
+    const source = frame.name() ? `frame:${frame.name()}` : `frame:${index}`;
+    addTarget(source, frame.url());
+  }
+
+  return Array.from(observed.values());
+}
+
+function detectWrongBlogTarget(page: Page, requestedBlogId: string) {
+  const normalizedRequestedBlogId = normalizeCredentialIdentity(requestedBlogId);
+  const observedTargets = collectObservedBlogTargets(page);
+  return observedTargets.find((target) => target.blogId !== normalizedRequestedBlogId) || null;
 }
 
 async function hasComposeAccess(page: Page, blogId: string) {
@@ -795,11 +1004,23 @@ async function hasComposeAccess(page: Page, blogId: string) {
     return { ok: false, reason: "NAVER_LOGIN_REQUIRED" as ReasonCode };
   }
 
-  if (isWrongBlogTarget(page.url(), blogId)) {
+  const wrongTarget = detectWrongBlogTarget(page, blogId);
+  if (wrongTarget) {
+    console.warn(
+      `[naverPublisher] Wrong blog target detected: requested=${blogId}, observed=${wrongTarget.blogId}, source=${wrongTarget.source}, url=${wrongTarget.url}`,
+    );
     return { ok: false, reason: "NAVER_WRONG_BLOG_TARGET" as ReasonCode };
   }
 
   await closePopups(page);
+
+  const wrongTargetAfterPopups = detectWrongBlogTarget(page, blogId);
+  if (wrongTargetAfterPopups) {
+    console.warn(
+      `[naverPublisher] Wrong blog target detected after popup cleanup: requested=${blogId}, observed=${wrongTargetAfterPopups.blogId}, source=${wrongTargetAfterPopups.source}, url=${wrongTargetAfterPopups.url}`,
+    );
+    return { ok: false, reason: "NAVER_WRONG_BLOG_TARGET" as ReasonCode };
+  }
 
   for (const selector of TITLE_SELECTORS) {
     if (await maybeVisible(page.locator(selector), 1200)) {
@@ -2126,14 +2347,28 @@ function normalizeHashtags(tags: string[]) {
 }
 
 async function fillContentAndInsertImagesBySectionStructure(page: Page, request: PublishRequest, imagePaths: string[]) {
-  if (!imagePaths.length) return false;
+  if (!imagePaths.length) {
+    console.warn("[naverPublisher] section structure aborted: no image paths");
+    return false;
+  }
 
   const sections = normalizeSectionsForImageCount(request, imagePaths.length);
-  if (sections.length !== imagePaths.length) return false;
+  console.log(
+    `[naverPublisher] section structure start: images=${imagePaths.length}, sections=${sections.length}`,
+  );
+  if (sections.length !== imagePaths.length) {
+    console.warn(
+      `[naverPublisher] section structure mismatch: images=${imagePaths.length}, sections=${sections.length}`,
+    );
+    return false;
+  }
 
   await dismissBlockingEditorPopup(page);
   const contentLocator = await focusContentEditorLocator(page);
-  if (!contentLocator) return false;
+  if (!contentLocator) {
+    console.warn("[naverPublisher] section structure aborted: content editor locator not found");
+    return false;
+  }
 
   await contentLocator.click({ timeout: 800 }).catch(() => contentLocator.click({ timeout: 800, force: true }));
   await page.keyboard.press("Meta+A").catch(() => {});
@@ -2150,11 +2385,17 @@ async function fillContentAndInsertImagesBySectionStructure(page: Page, request:
     const quoteSection = resolveQuoteSectionFromRequest(request);
     if (quoteSection.hasInput && quoteSection.quote) {
       quoteCardImagePath = await createQuoteCardImageFile(page, quoteSection.quote, quoteSection.philosopher);
-      if (!quoteCardImagePath) return false;
+      if (!quoteCardImagePath) {
+        console.warn("[naverPublisher] section structure aborted: quote card image creation failed");
+        return false;
+      }
 
       await moveCaretToEditorEnd(page);
       const quoteImageCount = await uploadImageAtCursorAndVerify(page, quoteCardImagePath, previousCount);
-      if (quoteImageCount < 0) return false;
+      if (quoteImageCount < 0) {
+        console.warn("[naverPublisher] section structure aborted: quote card upload failed");
+        return false;
+      }
       previousCount = quoteImageCount;
       await insertSingleParagraphGap(page);
     }
@@ -2162,11 +2403,17 @@ async function fillContentAndInsertImagesBySectionStructure(page: Page, request:
     for (let i = 0; i < imagePaths.length; i += 1) {
       const imagePath = imagePaths[i];
       const section = sections[i];
-      if (!imagePath || !section) return false;
+      if (!imagePath || !section) {
+        console.warn(`[naverPublisher] section structure aborted: missing image or section at index ${i}`);
+        return false;
+      }
 
       await moveCaretToEditorEnd(page);
       const currentCount = await uploadImageAtCursorAndVerify(page, imagePath, previousCount);
-      if (currentCount < 0) return false;
+      if (currentCount < 0) {
+        console.warn(`[naverPublisher] section structure image upload failed at index ${i}`);
+        return false;
+      }
       previousCount = currentCount;
       insertedImages += 1;
 
@@ -2218,13 +2465,25 @@ async function fillContentAndInsertImagesBySectionStructure(page: Page, request:
     }
   }
 
-  if (insertedImages !== imagePaths.length) return false;
-  return verifyEditorHasExpectedText(page, expectedParts.join("\n\n"));
+  if (insertedImages !== imagePaths.length) {
+    console.warn(
+      `[naverPublisher] section structure image count mismatch: inserted=${insertedImages}, requested=${imagePaths.length}`,
+    );
+    return false;
+  }
+  const verified = await verifyEditorHasExpectedText(page, expectedParts.join("\n\n"));
+  if (!verified) {
+    console.warn("[naverPublisher] section structure verification failed after editor write");
+  }
+  return verified;
 }
 
 async function verifyEditorHasExpectedText(page: Page, expectedRawText: string) {
   const expected = normalizeComparableText(expectedRawText);
-  if (!expected) return false;
+  if (!expected) {
+    console.warn("[naverPublisher] editor verification aborted: empty expected text");
+    return false;
+  }
 
   const observed = normalizeComparableText(await getEditorCombinedText(page));
   const firstNeedle = expected.slice(0, Math.min(10, expected.length));
@@ -2235,12 +2494,11 @@ async function verifyEditorHasExpectedText(page: Page, expectedRawText: string) 
   const minimumLength = Math.max(3, Math.min(60, Math.floor(expected.length * 0.05)));
   if (markerMatched || observed.length >= minimumLength) return true;
 
-  if (await hasEditorContentSignals(page)) {
-    const validationIssue = await detectPublishValidationIssue(page);
-    return validationIssue !== "CONTENT_REQUIRED";
-  }
-
+  const hasSignals = await hasEditorContentSignals(page);
   const validationIssue = await detectPublishValidationIssue(page);
+  console.warn(
+    `[naverPublisher] editor verification fallback: observedLen=${observed.length}, expectedLen=${expected.length}, minimumLength=${minimumLength}, markerMatched=${markerMatched}, hasSignals=${hasSignals}, validationIssue=${validationIssue}, observedTail=${JSON.stringify(observed.slice(-120))}`,
+  );
   return validationIssue !== "CONTENT_REQUIRED";
 }
 
@@ -2287,6 +2545,12 @@ async function fillContent(page: Page, content: string) {
 
 async function countEditorImages(page: Page) {
   const selectors = [
+    ".se-main-container .se-module-image",
+    ".se-main-container .se-section-image",
+    ".se-module-image",
+    ".se-section-image",
+    ".se-image-strip",
+    ".se-component-content img",
     ".se-main-container img",
     ".se-module-image img",
     ".se-image-resource",
@@ -2302,11 +2566,10 @@ async function countEditorImages(page: Page) {
     }
   }
 
-  const mainFrame = page.frame({ name: "mainFrame" });
-  if (mainFrame) {
+  for (const frame of page.frames()) {
     for (const selector of selectors) {
       try {
-        const count = await mainFrame.locator(selector).count();
+        const count = await frame.locator(selector).count();
         maxCount = Math.max(maxCount, count);
       } catch {
         // ignore
@@ -2502,11 +2765,10 @@ async function openImagePicker(page: Page) {
     }
   }
 
-  const mainFrame = page.frame({ name: "mainFrame" });
-  if (mainFrame) {
+  for (const frame of page.frames()) {
     for (const selector of IMAGE_TOOL_SELECTORS) {
       try {
-        if (await clickIfVisible(mainFrame, selector, 1400)) {
+        if (await clickIfVisible(frame, selector, 1400)) {
           await page.waitForTimeout(300);
           await clickImageSourceOption(page).catch(() => {});
           return true;
@@ -2540,40 +2802,54 @@ async function openImagePicker(page: Page) {
   return false;
 }
 
+async function setInputFilesAcrossRoots(page: Page, imagePath: string, timeoutMs = 0) {
+  const deadline = Date.now() + Math.max(0, timeoutMs);
+
+  do {
+    if (await setInputFilesByRoot(page, imagePath)) return true;
+
+    for (const frame of page.frames()) {
+      if (await setInputFilesByRoot(frame, imagePath)) {
+        return true;
+      }
+    }
+
+    if (Date.now() >= deadline) break;
+    await page.waitForTimeout(250);
+  } while (true);
+
+  return false;
+}
+
 async function uploadSingleImage(page: Page, imagePath: string) {
-  if (await setInputFilesByRoot(page, imagePath)) {
+  if (await setInputFilesAcrossRoots(page, imagePath, 1200)) {
+    console.log("[naverPublisher] image upload: direct input assignment succeeded");
     return true;
   }
 
-  for (const frame of page.frames()) {
-    if (await setInputFilesByRoot(frame, imagePath)) {
-      return true;
-    }
+  const chooserPromise = page.waitForEvent("filechooser", { timeout: 7000 }).catch(() => null);
+  const pickerOpened = await openImagePicker(page).catch(() => false);
+  if (!pickerOpened) {
+    console.warn("[naverPublisher] image upload: image picker did not open");
   }
-
-  const chooserPromise = page.waitForEvent("filechooser", { timeout: 3000 }).catch(() => null);
-  await openImagePicker(page).catch(() => {});
 
   const chooser = await chooserPromise;
   if (chooser) {
     try {
       await chooser.setFiles(imagePath);
+      console.log("[naverPublisher] image upload: filechooser assignment succeeded");
       return true;
     } catch {
       // fallback to direct input retry
     }
   }
 
-  if (await setInputFilesByRoot(page, imagePath)) {
+  if (await setInputFilesAcrossRoots(page, imagePath, 5000)) {
+    console.log("[naverPublisher] image upload: delayed input assignment succeeded");
     return true;
   }
 
-  for (const frame of page.frames()) {
-    if (await setInputFilesByRoot(frame, imagePath)) {
-      return true;
-    }
-  }
-
+  console.warn("[naverPublisher] image upload: all input strategies failed");
   return false;
 }
 
@@ -2617,7 +2893,7 @@ async function uploadImageAtCursorAndVerify(page: Page, imagePath: string, previ
       continue;
     }
 
-    const waitMs = 5000 + attempt * 3000;
+    const waitMs = 12000 + attempt * 5000;
     const currentCount = await waitForEditorImageCountAtLeast(page, targetCount, waitMs);
 
     if (await hasFileTransferErrorPopup(page)) {
@@ -2630,7 +2906,7 @@ async function uploadImageAtCursorAndVerify(page: Page, imagePath: string, previ
     }
 
     // 이미지 업로드 반영 지연을 고려해 재업로드 전에 마지막 확인을 한 번 더 수행합니다.
-    const delayedCount = await waitForEditorImageCountAtLeast(page, targetCount, 3500);
+    const delayedCount = await waitForEditorImageCountAtLeast(page, targetCount, 8000);
     if (delayedCount >= targetCount) return delayedCount;
   }
 
@@ -3278,7 +3554,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
 
   try {
     browser = await getOrLaunchBrowser(headless);
-    context = await createContext(browser, credentials);
+    context = await createContext(browser, credentials, request.sessionControl);
     if (traceEnabled) {
       await context.tracing.start({ screenshots: true, snapshots: true, sources: true }).catch(() => {});
       traceStarted = true;
@@ -3304,7 +3580,7 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
     }
 
     // 성공 시 해당 계정의 세션 저장
-    await context.storageState({ path: getSessionFile(credentials.username, credentials.blogId) });
+    await persistSessionState(context, credentials);
 
     const titleOk = await fillTitle(page, request.title.trim());
     if (!titleOk) {
@@ -3437,6 +3713,21 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
 
     await enforceNoWordBreakAcrossEditor(page).catch(() => {});
 
+    const prePublishWrongTarget = detectWrongBlogTarget(page, credentials.blogId);
+    if (prePublishWrongTarget) {
+      deleteSessionFile(credentials.username, credentials.blogId);
+      const screenshotPath = await saveFailureScreenshot(page, "NAVER_WRONG_BLOG_TARGET");
+      return finish({
+        ok: false,
+        reason: "NAVER_WRONG_BLOG_TARGET",
+        postUrl: "",
+        contentLength: 0,
+        screenshotPath,
+        message:
+          `발행 전 편집기가 요청 블로그(${credentials.blogId})가 아닌 ${prePublishWrongTarget.blogId}로 감지되어 중단했습니다.`,
+      });
+    }
+
     const publishLayerOpened = await openPublishLayer(page);
     if (!publishLayerOpened) {
       const screenshotPath = await saveFailureScreenshot(page, "POST_FAIL");
@@ -3476,8 +3767,22 @@ async function publishToNaverOnce(request: PublishRequest, attempt: number): Pro
       });
     }
 
+    const publishedBlogId = extractObservedBlogIdFromUrl(verified.postUrl);
+    if (publishedBlogId && publishedBlogId !== normalizeCredentialIdentity(credentials.blogId)) {
+      deleteSessionFile(credentials.username, credentials.blogId);
+      const screenshotPath = await saveFailureScreenshot(page, "NAVER_WRONG_BLOG_TARGET");
+      return finish({
+        ok: false,
+        reason: "NAVER_WRONG_BLOG_TARGET",
+        postUrl: verified.postUrl,
+        contentLength: 0,
+        screenshotPath,
+        message: `발행 결과가 요청 블로그(${credentials.blogId})가 아닌 ${publishedBlogId}로 감지되었습니다.`,
+      });
+    }
+
     const contentLength = await publishedContentLength(page);
-    await context.storageState({ path: getSessionFile(credentials.username, credentials.blogId) });
+    await persistSessionState(context, credentials);
 
     succeeded = true;
     return finish({

@@ -43,6 +43,15 @@ interface PublishCredentials {
   blogId: string;
 }
 
+interface PublishSessionControl {
+  credentialOwner?: string;
+  sessionKey?: string;
+  forceFreshLogin: boolean;
+  resetSession: boolean;
+  clearCookies: boolean;
+  clearStorage: boolean;
+}
+
 interface ParsedPublishCredentials {
   provided: boolean;
   credentials: PublishCredentials | null;
@@ -89,6 +98,10 @@ function toRawString(value: unknown) {
   return typeof value === "string" ? value : "";
 }
 
+function toSafeBoolean(value: unknown) {
+  return value === true;
+}
+
 function toSafeStringArray(value: unknown) {
   if (!Array.isArray(value)) return [];
   return value
@@ -133,6 +146,33 @@ function parseRequestCredentials(payload: any): ParsedPublishCredentials {
       blogId,
     },
   };
+}
+
+function parseRequestSessionControl(payload: any): PublishSessionControl | null {
+  const body = payload && typeof payload === "object" ? payload : {};
+  const nested = body.sessionControl && typeof body.sessionControl === "object" ? body.sessionControl : {};
+
+  const sessionControl: PublishSessionControl = {
+    credentialOwner: toSafeString(nested.credentialOwner ?? body.credentialOwner),
+    sessionKey: toSafeString(nested.sessionKey ?? body.sessionKey),
+    forceFreshLogin: toSafeBoolean(nested.forceFreshLogin ?? body.forceFreshLogin),
+    resetSession: toSafeBoolean(nested.resetSession ?? body.resetSession),
+    clearCookies: toSafeBoolean(nested.clearCookies ?? body.clearCookies),
+    clearStorage: toSafeBoolean(nested.clearStorage ?? body.clearStorage),
+  };
+
+  if (
+    !sessionControl.credentialOwner &&
+    !sessionControl.sessionKey &&
+    !sessionControl.forceFreshLogin &&
+    !sessionControl.resetSession &&
+    !sessionControl.clearCookies &&
+    !sessionControl.clearStorage
+  ) {
+    return null;
+  }
+
+  return sessionControl;
 }
 
 function getGeminiKeyCooldownMs(apiKey: string) {
@@ -339,6 +379,7 @@ async function runPublishJob(
   content: string,
   images: string[],
   credentials: PublishCredentials,
+  sessionControl?: PublishSessionControl | null,
 ) {
   const userKey = getPublishJobUserKey(credentials);
   updatePublishJob(jobId, {
@@ -347,7 +388,7 @@ async function runPublishJob(
   });
 
   try {
-    const result = await publishToNaver({ title, content, images, credentials });
+    const result = await publishToNaver({ title, content, images, credentials, sessionControl: sessionControl || undefined });
     if (!result.ok) {
       updatePublishJob(jobId, {
         status: "failed",
@@ -496,6 +537,7 @@ async function startServer() {
       const { title, content, images, quote, quoteText, quoteAuthor, sections, hashtags } = req.body || {};
       const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
       const parsedCredentials = parseRequestCredentials(req.body);
+      const sessionControl = parseRequestSessionControl(req.body);
 
       if (!title || !normalizedContent) {
         return res.status(400).json({
@@ -525,6 +567,7 @@ async function startServer() {
         content: normalizedContent,
         images,
         credentials: parsedCredentials.credentials,
+        sessionControl: sessionControl || undefined,
         quote,
         quoteText,
         quoteAuthor,
@@ -577,6 +620,7 @@ async function startServer() {
     const { title, content, images } = req.body || {};
     const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
     const parsedCredentials = parseRequestCredentials(req.body);
+    const sessionControl = parseRequestSessionControl(req.body);
 
     if (!title || !normalizedContent) {
       return res.status(400).json({
@@ -625,7 +669,7 @@ async function startServer() {
       acceptedAt: job.createdAt,
     });
 
-    void runPublishJob(job.id, title, normalizedContent, imageList, parsedCredentials.credentials);
+    void runPublishJob(job.id, title, normalizedContent, imageList, parsedCredentials.credentials, sessionControl);
   });
 
   app.get("/api/publish-status/:jobId", (req, res) => {
@@ -701,6 +745,7 @@ async function startServer() {
     const sampleContent =
       "오늘은 네이버 자동 발행 기능을 점검하기 위한 테스트 글입니다. 로그인 후 제목, 본문, 이미지 입력과 발행 단계가 정상 완료되는지 확인합니다.";
     const parsedCredentials = parseRequestCredentials(req.body);
+    const sessionControl = parseRequestSessionControl(req.body);
 
     if (!parsedCredentials.credentials) {
       return res.status(400).json({
@@ -725,6 +770,7 @@ async function startServer() {
         content: sampleContent,
         images: sampleImages,
         credentials: parsedCredentials.credentials,
+        sessionControl: sessionControl || undefined,
       });
 
       if (!result.ok) {
