@@ -373,6 +373,18 @@ function updatePublishJob(jobId: string, patch: Partial<PublishAsyncJob>) {
   });
 }
 
+function supersedePublishJob(jobId: string, userKey: string) {
+  updatePublishJob(jobId, {
+    status: "failed",
+    reason: "SUPERSEDED",
+    message: "같은 계정의 새 발행 요청이 들어와 이전 작업을 중단했습니다.",
+    url: "",
+  });
+  if (activePublishJobByUser.get(userKey) === jobId) {
+    activePublishJobByUser.delete(userKey);
+  }
+}
+
 async function runPublishJob(
   jobId: string,
   title: string,
@@ -649,13 +661,7 @@ async function startServer() {
     const activeJob = activeJobId ? publishJobs.get(activeJobId) : null;
 
     if (activeJob && (activeJob.status === "queued" || activeJob.status === "running")) {
-      return res.status(409).json({
-        success: false,
-        reason: "PUBLISH_IN_PROGRESS",
-        message: "같은 계정의 이전 발행 작업이 아직 진행 중입니다. 완료 후 다시 시도해주세요.",
-        jobId: activeJob.id,
-        status: activeJob.status,
-      });
+      supersedePublishJob(activeJob.id, userKey);
     }
 
     const job = createPublishJob();
