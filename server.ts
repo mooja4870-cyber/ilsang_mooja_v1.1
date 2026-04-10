@@ -57,6 +57,11 @@ interface ParsedPublishCredentials {
   credentials: PublishCredentials | null;
 }
 
+interface CredentialScopeValidation {
+  ok: boolean;
+  message?: string;
+}
+
 const GEMINI_KEY_COOLDOWN_DEFAULT_SECONDS = 30;
 const GEMINI_KEY_COOLDOWN_INVALID_SECONDS = 600;
 const GEMINI_KEY_COOLDOWN_MAX_SECONDS = 600;
@@ -173,6 +178,53 @@ function parseRequestSessionControl(payload: any): PublishSessionControl | null 
   }
 
   return sessionControl;
+}
+
+function normalizeCredentialOwner(credentials: PublishCredentials) {
+  return `${credentials.username.trim().toLowerCase()}::${credentials.blogId.trim().toLowerCase()}`;
+}
+
+function validateCredentialScope(
+  credentials: PublishCredentials,
+  sessionControl: PublishSessionControl | null,
+): CredentialScopeValidation {
+  if (!sessionControl) {
+    return {
+      ok: false,
+      message: "현재 사용자 계정 검증 정보가 없습니다. 앱의 계정 입력란에 저장된 정보로 다시 시도해주세요.",
+    };
+  }
+
+  const expectedOwner = normalizeCredentialOwner(credentials);
+  const expectedSessionKey = `myday209:${expectedOwner}`;
+
+  if (!sessionControl.credentialOwner || sessionControl.credentialOwner !== expectedOwner) {
+    return {
+      ok: false,
+      message: "현재 사용자 계정 검증에 실패했습니다. 저장된 사용자 계정 정보로 다시 시도해주세요.",
+    };
+  }
+
+  if (!sessionControl.sessionKey || sessionControl.sessionKey !== expectedSessionKey) {
+    return {
+      ok: false,
+      message: "사용자 세션 식별값이 일치하지 않습니다. 앱을 다시 열고 계정 정보를 확인해주세요.",
+    };
+  }
+
+  if (
+    !sessionControl.forceFreshLogin ||
+    !sessionControl.resetSession ||
+    !sessionControl.clearCookies ||
+    !sessionControl.clearStorage
+  ) {
+    return {
+      ok: false,
+      message: "사용자 계정 보호를 위한 새 로그인 조건이 충족되지 않았습니다. 최신 앱에서 다시 시도해주세요.",
+    };
+  }
+
+  return { ok: true };
 }
 
 function getGeminiKeyCooldownMs(apiKey: string) {
@@ -572,6 +624,16 @@ async function startServer() {
         });
       }
 
+      const scopeValidation = validateCredentialScope(parsedCredentials.credentials, sessionControl);
+      if (!scopeValidation.ok) {
+        return res.status(400).json({
+          success: false,
+          reason: "INVALID_CREDENTIAL_SCOPE",
+          message: scopeValidation.message,
+          url: "",
+        });
+      }
+
       console.log(`\x1b[36m[POSTING]\x1b[0m Publishing to Naver... (Images: ${images?.length || 0})`);
       
       const result = await publishToNaver({
@@ -651,6 +713,16 @@ async function startServer() {
           parsedCredentials.provided
             ? "요청 계정 정보가 불완전합니다. 네이버 아이디/비밀번호/블로그 아이디를 모두 입력해주세요."
             : "요청 계정 정보가 없습니다. 네이버 아이디/비밀번호/블로그 아이디를 입력해주세요.",
+        url: "",
+      });
+    }
+
+    const scopeValidation = validateCredentialScope(parsedCredentials.credentials, sessionControl);
+    if (!scopeValidation.ok) {
+      return res.status(400).json({
+        success: false,
+        reason: "INVALID_CREDENTIAL_SCOPE",
+        message: scopeValidation.message,
         url: "",
       });
     }
@@ -761,6 +833,16 @@ async function startServer() {
           parsedCredentials.provided
             ? "요청 계정 정보가 불완전합니다. 네이버 아이디/비밀번호/블로그 아이디를 모두 입력해주세요."
             : "요청 계정 정보가 없습니다. 네이버 아이디/비밀번호/블로그 아이디를 입력해주세요.",
+        url: "",
+      });
+    }
+
+    const scopeValidation = validateCredentialScope(parsedCredentials.credentials, sessionControl);
+    if (!scopeValidation.ok) {
+      return res.status(400).json({
+        success: false,
+        reason: "INVALID_CREDENTIAL_SCOPE",
+        message: scopeValidation.message,
         url: "",
       });
     }
