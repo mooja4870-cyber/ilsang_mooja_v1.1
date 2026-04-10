@@ -65,6 +65,12 @@ interface CredentialScopeValidation {
   message?: string;
 }
 
+const FORBIDDEN_DEFAULT_NAVER_CREDENTIAL_ENV_KEYS = [
+  "NAVER_USERNAME",
+  "NAVER_PASSWORD",
+  "NAVER_BLOG_ID",
+] as const;
+
 const GEMINI_KEY_COOLDOWN_DEFAULT_SECONDS = 30;
 const GEMINI_KEY_COOLDOWN_INVALID_SECONDS = 600;
 const GEMINI_KEY_COOLDOWN_MAX_SECONDS = 600;
@@ -108,6 +114,32 @@ function toRawString(value: unknown) {
 
 function toSafeBoolean(value: unknown) {
   return value === true;
+}
+
+function getConfiguredDefaultNaverCredentialEnvKeys() {
+  return FORBIDDEN_DEFAULT_NAVER_CREDENTIAL_ENV_KEYS.filter((key) => toSafeString(process.env[key]).length > 0);
+}
+
+function createDefaultNaverCredentialEnvError() {
+  const configuredKeys = getConfiguredDefaultNaverCredentialEnvKeys();
+  return {
+    success: false,
+    reason: "SERVER_DEFAULT_CREDENTIALS_CONFIGURED",
+    message:
+      "서버에 기본 네이버 계정 설정이 남아 있습니다. 운영 환경에서 NAVER_USERNAME/NAVER_PASSWORD/NAVER_BLOG_ID를 삭제한 뒤 다시 시도해주세요.",
+    configuredKeys,
+    url: "",
+  };
+}
+
+function logPublishScope(
+  route: string,
+  credentials: PublishCredentials,
+  sessionControl: PublishSessionControl | null,
+) {
+  console.log(
+    `[POST_SCOPE:${route}] user=${credentials.username} blog=${credentials.blogId} owner=${sessionControl?.credentialOwner || "-"} sessionKey=${sessionControl?.sessionKey || "-"} runtime=${sessionControl?.runtimeProject || "-"} package=${sessionControl?.runtimePackage || "-"} setupKey=${sessionControl?.runtimeSetupKey || "-"}`,
+  );
 }
 
 function toSafeStringArray(value: unknown) {
@@ -531,6 +563,13 @@ async function runPublishJob(
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
+  const configuredDefaultNaverCredentialEnvKeys = getConfiguredDefaultNaverCredentialEnvKeys();
+
+  if (configuredDefaultNaverCredentialEnvKeys.length > 0) {
+    console.error(
+      `[CONFIG] Forbidden default NAVER credential env vars configured: ${configuredDefaultNaverCredentialEnvKeys.join(", ")}`,
+    );
+  }
   
   // CORS 설정: Streamlit Cloud로부터의 외부 요청 허용
   app.use(cors({
@@ -550,6 +589,7 @@ async function startServer() {
       service: "ilsang-mooja",
       time: new Date().toISOString(),
       nodeEnv: process.env.NODE_ENV || "development",
+      defaultNaverCredentialFallbackConfigured: getConfiguredDefaultNaverCredentialEnvKeys().length > 0,
     });
   });
 
@@ -633,6 +673,10 @@ async function startServer() {
 
   app.post("/api/publish", async (req, res) => {
     try {
+      if (getConfiguredDefaultNaverCredentialEnvKeys().length > 0) {
+        return res.status(500).json(createDefaultNaverCredentialEnvError());
+      }
+
       const { title, content, images, quote, quoteText, quoteAuthor, sections, hashtags } = req.body || {};
       const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
       const parsedCredentials = parseRequestCredentials(req.body);
@@ -668,6 +712,8 @@ async function startServer() {
           url: "",
         });
       }
+
+      logPublishScope("/api/publish", parsedCredentials.credentials, sessionControl);
 
       console.log(`\x1b[36m[POSTING]\x1b[0m Publishing to Naver... (Images: ${images?.length || 0})`);
       
@@ -726,6 +772,10 @@ async function startServer() {
   });
 
   app.post("/api/publish-async", async (req, res) => {
+    if (getConfiguredDefaultNaverCredentialEnvKeys().length > 0) {
+      return res.status(500).json(createDefaultNaverCredentialEnvError());
+    }
+
     const { title, content, images } = req.body || {};
     const normalizedContent = typeof content === "string" ? normalizeEscapedLineBreaks(content) : "";
     const parsedCredentials = parseRequestCredentials(req.body);
@@ -761,6 +811,8 @@ async function startServer() {
         url: "",
       });
     }
+
+    logPublishScope("/api/publish-async", parsedCredentials.credentials, sessionControl);
 
     const imageList = Array.isArray(images) ? images : [];
     const userKey = getPublishJobUserKey(parsedCredentials.credentials);
@@ -854,6 +906,10 @@ async function startServer() {
   });
 
   app.post("/api/publish-sample", async (req, res) => {
+    if (getConfiguredDefaultNaverCredentialEnvKeys().length > 0) {
+      return res.status(500).json(createDefaultNaverCredentialEnvError());
+    }
+
     const sampleTitle = "[테스트] 네이버 자동 발행 샘플";
     const sampleContent =
       "오늘은 네이버 자동 발행 기능을 점검하기 위한 테스트 글입니다. 로그인 후 제목, 본문, 이미지 입력과 발행 단계가 정상 완료되는지 확인합니다.";
@@ -881,6 +937,8 @@ async function startServer() {
         url: "",
       });
     }
+
+    logPublishScope("/api/publish-sample", parsedCredentials.credentials, sessionControl);
 
     const sampleImages = [
       "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAZAAAADICAIAAABJdyC1AAABdElEQVR4nO3UQQ0AIBDAMMC/58MCP7KkVbDX9swZAIDvM+8AAPyZsQABAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBAgQIAAAQIECBD4B8M2A7uKXu95AAAAAElFTkSuQmCC",
