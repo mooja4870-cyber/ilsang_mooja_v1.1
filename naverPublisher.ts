@@ -353,6 +353,24 @@ function isRetryableSessionFailure(reason: ReasonCode) {
   ].includes(reason);
 }
 
+function getSessionFailureMessage(reason: ReasonCode) {
+  switch (reason) {
+    case "NAVER_CAPTCHA_REQUIRED":
+      return "네이버에서 추가 인증 또는 캡차를 요구했습니다.";
+    case "NAVER_WRONG_BLOG_TARGET":
+      return "로그인 후 요청한 블로그 글쓰기 화면으로 연결되지 않았습니다.";
+    case "NAVER_SESSION_PROBE_TIMEOUT":
+      return "로그인 후 글쓰기 화면 진입을 확인하지 못했습니다.";
+    case "NAVER_LOGIN_REQUIRED":
+      return "네이버 로그인 페이지에서 세션이 완료되지 않았습니다.";
+    case "NAVER_SESSION_INVALID":
+    case "NAVER_SESSION_MISSING":
+      return "저장된 세션이 없거나 유효하지 않습니다.";
+    default:
+      return "로그인 또는 세션 준비에 실패했습니다.";
+  }
+}
+
 function loadCredentials(requestCredentials: PublishRequest["credentials"]): Credentials {
   const username = typeof requestCredentials?.username === "string" ? requestCredentials.username.trim() : "";
   const password = typeof requestCredentials?.password === "string" ? requestCredentials.password : "";
@@ -3654,7 +3672,7 @@ async function publishToNaverOnce(
         postUrl: "",
         contentLength: 0,
         screenshotPath: probe.screenshotPath,
-        message: "로그인 또는 세션 준비에 실패했습니다.",
+        message: getSessionFailureMessage(probe.reason),
       });
     }
 

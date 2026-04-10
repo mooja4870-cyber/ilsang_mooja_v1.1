@@ -46,6 +46,9 @@ interface PublishCredentials {
 interface PublishSessionControl {
   credentialOwner?: string;
   sessionKey?: string;
+  runtimeProject?: string;
+  runtimePackage?: string;
+  runtimeSetupKey?: string;
   forceFreshLogin: boolean;
   resetSession: boolean;
   clearCookies: boolean;
@@ -160,6 +163,9 @@ function parseRequestSessionControl(payload: any): PublishSessionControl | null 
   const sessionControl: PublishSessionControl = {
     credentialOwner: toSafeString(nested.credentialOwner ?? body.credentialOwner),
     sessionKey: toSafeString(nested.sessionKey ?? body.sessionKey),
+    runtimeProject: toSafeString(nested.runtimeProject ?? body.runtimeProject),
+    runtimePackage: toSafeString(nested.runtimePackage ?? body.runtimePackage),
+    runtimeSetupKey: toSafeString(nested.runtimeSetupKey ?? body.runtimeSetupKey),
     forceFreshLogin: toSafeBoolean(nested.forceFreshLogin ?? body.forceFreshLogin),
     resetSession: toSafeBoolean(nested.resetSession ?? body.resetSession),
     clearCookies: toSafeBoolean(nested.clearCookies ?? body.clearCookies),
@@ -169,6 +175,9 @@ function parseRequestSessionControl(payload: any): PublishSessionControl | null 
   if (
     !sessionControl.credentialOwner &&
     !sessionControl.sessionKey &&
+    !sessionControl.runtimeProject &&
+    !sessionControl.runtimePackage &&
+    !sessionControl.runtimeSetupKey &&
     !sessionControl.forceFreshLogin &&
     !sessionControl.resetSession &&
     !sessionControl.clearCookies &&
@@ -184,6 +193,30 @@ function normalizeCredentialOwner(credentials: PublishCredentials) {
   return `${credentials.username.trim().toLowerCase()}::${credentials.blogId.trim().toLowerCase()}`;
 }
 
+function getExpectedSessionKeyPrefixes(sessionControl: PublishSessionControl) {
+  const runtimeProject = sessionControl.runtimeProject.trim().toLowerCase();
+  const runtimePackage = sessionControl.runtimePackage.trim().toLowerCase();
+  const runtimeSetupKey = sessionControl.runtimeSetupKey.trim().toUpperCase();
+
+  if (
+    runtimeProject === "myday210" ||
+    runtimePackage === "com.mooja.myday210" ||
+    runtimeSetupKey === "MYDAY210_SETUP_V1"
+  ) {
+    return ["myday210"];
+  }
+
+  if (
+    runtimeProject === "myday209" ||
+    runtimePackage === "com.mooja.myday209" ||
+    runtimeSetupKey === "MYDAY209_SETUP_V1"
+  ) {
+    return ["myday209"];
+  }
+
+  return ["myday210", "myday209"];
+}
+
 function validateCredentialScope(
   credentials: PublishCredentials,
   sessionControl: PublishSessionControl | null,
@@ -196,7 +229,9 @@ function validateCredentialScope(
   }
 
   const expectedOwner = normalizeCredentialOwner(credentials);
-  const expectedSessionKey = `myday209:${expectedOwner}`;
+  const expectedSessionKeys = getExpectedSessionKeyPrefixes(sessionControl).map(
+    (prefix) => `${prefix}:${expectedOwner}`,
+  );
 
   if (!sessionControl.credentialOwner || sessionControl.credentialOwner !== expectedOwner) {
     return {
@@ -205,10 +240,10 @@ function validateCredentialScope(
     };
   }
 
-  if (!sessionControl.sessionKey || sessionControl.sessionKey !== expectedSessionKey) {
+  if (!sessionControl.sessionKey || !expectedSessionKeys.includes(sessionControl.sessionKey)) {
     return {
       ok: false,
-      message: "사용자 세션 식별값이 일치하지 않습니다. 앱을 다시 열고 계정 정보를 확인해주세요.",
+      message: "사용자 세션 식별값이 일치하지 않습니다. 최신 앱에서 다시 로그인 후 시도해주세요.",
     };
   }
 
