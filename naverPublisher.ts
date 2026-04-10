@@ -526,6 +526,38 @@ function deleteSessionFile(username?: string, blogId?: string) {
   }
 }
 
+function listSessionArtifacts() {
+  if (!fs.existsSync(RUNTIME_DIR)) return [];
+  try {
+    return fs
+      .readdirSync(RUNTIME_DIR)
+      .filter((name) => name.startsWith("browser_session") && name.endsWith(".json"))
+      .map((name) => path.join(RUNTIME_DIR, name));
+  } catch {
+    return [];
+  }
+}
+
+function purgeLegacySessionArtifacts() {
+  deleteSessionFile();
+}
+
+function purgeOtherCredentialSessionArtifacts(credentials: Credentials) {
+  const keep = new Set([
+    getSessionFile(credentials.username, credentials.blogId),
+    getSessionMetaFile(credentials.username, credentials.blogId),
+  ]);
+
+  for (const file of listSessionArtifacts()) {
+    if (keep.has(file)) continue;
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 function getBrowserExecutablePath() {
   const explicitPath = process.env.BROWSER_EXECUTABLE_PATH || process.env.AUTO_POST_CHROME_PATH;
   if (explicitPath && fs.existsSync(explicitPath)) return explicitPath;
@@ -648,6 +680,15 @@ function shouldForceFreshContext(sessionControl?: PublishSessionControl) {
   return Boolean(sessionControl?.forceFreshLogin || sessionControl?.resetSession);
 }
 
+function shouldPurgeSessionArtifacts(sessionControl?: PublishSessionControl) {
+  return Boolean(
+    sessionControl?.forceFreshLogin ||
+      sessionControl?.resetSession ||
+      sessionControl?.clearCookies ||
+      sessionControl?.clearStorage,
+  );
+}
+
 async function createContext(
   browser: Browser,
   credentials?: Credentials,
@@ -657,8 +698,21 @@ async function createContext(
   const blogId = credentials?.blogId;
   const sessionFile = getSessionFile(username, blogId);
   const forceFreshContext = shouldForceFreshContext(sessionControl);
+  const purgeRequested = shouldPurgeSessionArtifacts(sessionControl);
 
-  if (username && forceFreshContext) {
+  if (username && fs.existsSync(SESSION_FILE_LEGACY)) {
+    console.log("[naverPublisher] Removing legacy shared session trace before publish");
+    purgeLegacySessionArtifacts();
+  }
+
+  if (username && credentials && purgeRequested) {
+    console.log(
+      `[naverPublisher] Purging saved session traces for ${username} (${blogId || "unknown-blog"})`,
+    );
+    purgeOtherCredentialSessionArtifacts(credentials);
+    deleteSessionFile(username, blogId);
+    await disposeReusableBrowser("session trace purge requested");
+  } else if (username && forceFreshContext) {
     console.log(
       `[naverPublisher] Forcing fresh login context for ${username} (${blogId || "unknown-blog"})`,
     );
